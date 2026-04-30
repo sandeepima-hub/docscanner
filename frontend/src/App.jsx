@@ -3,13 +3,66 @@ import {
   Upload, Camera, FileText, Download, Loader2, CheckCircle,
   AlertCircle, Trash2, Eye, EyeOff, ChevronRight, ChevronDown,
   RotateCcw, FileOutput, BookOpen, Sparkles, Settings, Menu, X,
-  ScanLine, FilePlus, Layers, Search, Globe, Cpu,
+  ScanLine, FilePlus, Layers, Search, Globe, Cpu, Plus, Scissors,
 } from "lucide-react";
 import { createWorker } from "tesseract.js";
 
 // ─── Config ────────────────────────────────────────────────────────────────
-const API = import.meta.env.VITE_API_URL || "";   // e.g. https://api.yourapp.com
-                                                    // empty = use Vite proxy (local dev)
+const API = import.meta.env.VITE_API_URL || "";
+
+// ─── Auto-crop: detect document edges using canvas ──────────────────────────
+async function autoCropImage(dataURL) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0);
+
+      const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+      let minX = canvas.width, minY = canvas.height, maxX = 0, maxY = 0;
+      const threshold = 240; // white background threshold
+
+      for (let y = 0; y < canvas.height; y++) {
+        for (let x = 0; x < canvas.width; x++) {
+          const idx = (y * canvas.width + x) * 4;
+          const r = data[idx], g = data[idx+1], b = data[idx+2];
+          // If pixel is not near-white, it's content
+          if (r < threshold || g < threshold || b < threshold) {
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+          }
+        }
+      }
+
+      // Add padding
+      const pad = 20;
+      minX = Math.max(0, minX - pad);
+      minY = Math.max(0, minY - pad);
+      maxX = Math.min(canvas.width, maxX + pad);
+      maxY = Math.min(canvas.height, maxY + pad);
+
+      const cropW = maxX - minX;
+      const cropH = maxY - minY;
+
+      // If crop is too small or failed, return original
+      if (cropW < 100 || cropH < 100) { resolve(dataURL); return; }
+
+      const cropCanvas = document.createElement("canvas");
+      cropCanvas.width = cropW;
+      cropCanvas.height = cropH;
+      const cropCtx = cropCanvas.getContext("2d");
+      cropCtx.drawImage(canvas, minX, minY, cropW, cropH, 0, 0, cropW, cropH);
+      resolve(cropCanvas.toDataURL("image/jpeg", 0.92));
+    };
+    img.onerror = () => resolve(dataURL);
+    img.src = dataURL;
+  });
+}
 
 // ─── Tiny utilities ─────────────────────────────────────────────────────────
 const uid = () => `d_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
@@ -564,6 +617,7 @@ export default function App() {
     const fd = new FormData();
     fd.append("file", file);
     fd.append("language", language);
+    fd.append("engine", ocrMode === "mistral" ? "mistral" : "auto");
     const r = await fetch(`${API}/api/ocr`, { method:"POST", body:fd });
     if (!r.ok) throw new Error(`Backend OCR error ${r.status}`);
     return r.json();
@@ -590,21 +644,38 @@ export default function App() {
   };
 
   // ── Process one file ──────────────────────────────────────────────────────
-  const processFile = useCallback(async (file) => {
-    const id    = uid();
+  const processFile = useCallback(async (file, existingDocId = null, pageNum = null) => {
+    const id    = existingDocId || uid();
     const ext   = file.name.split(".").pop().toLowerCase();
-    const thumb = file.type.startsWith("image/") ? await toDataURL(file) : null;
+    const isImg = file.type.startsWith("image/");
 
-    const newDoc = {
-      id, name: file.name, title: safeName(file.name),
-      date: Date.now(), status:"processing",
-      thumb, rawFile: file, ext, pages:1,
-      text:"", sections:[], wordCount:0, charCount:0,
-      progress:0, progressLabel:"Starting…",
-    };
-    setDocs(ds => [newDoc, ...ds]);
-    setActiveId(id);
-    if (isMobile) setMobileTab("result");
+    // Auto-crop image before processing
+    let thumb = null;
+    let croppedFile = file;
+    if (isImg) {
+      patchDoc(id, { progressLabel:"Auto-cropping…", progress:5 });
+      const rawDataURL = await toDataURL(file);
+      const croppedDataURL = await autoCropImage(rawDataURL);
+      thumb = croppedDataURL;
+      // Convert cropped dataURL back to File
+      const res = await fetch(croppedDataURL);
+      const blob = await res.blob();
+      croppedFile = new File([blob], file.name, { type:"image/jpeg" });
+    }
+
+    if (!existingDocId) {
+      const newDoc = {
+        id, name: file.name, title: safeName(file.name),
+        date: Date.now(), status:"processing",
+        thumb, rawFile: croppedFile, ext, pages:1,
+        text:"", sections:[], wordCount:0, charCount:0,
+        progress:5, progressLabel:"Auto-cropped — starting OCR…",
+        allPages: [], // for multi-page
+      };
+      setDocs(ds => [newDoc, ...ds]);
+      setActiveId(id);
+      if (isMobile) setMobileTab("result");
+    }
 
     try {
       const useBackend = ocrMode==="backend" || (ocrMode==="auto" && apiStatus==="ok");
@@ -612,10 +683,10 @@ export default function App() {
 
       if (useBackend && apiStatus==="ok") {
         patchDoc(id, { progressLabel:"Uploading to server…", progress:10 });
-        result = await backendOCR(file, id);
+        result = await backendOCR(croppedFile, id);
         patchDoc(id, { progress:90, progressLabel:"Finalising…" });
       } else {
-        result = await browserOCR(file, id);
+        result = await browserOCR(croppedFile, id);
       }
 
       patchDoc(id, {
@@ -667,7 +738,7 @@ export default function App() {
 
   const UploadZone = () => (
     <div>
-      <p style={S.muted}>Upload images or PDFs. OCR runs via the backend (pytesseract) or your browser (Tesseract.js).</p>
+      <p style={S.muted}>Upload images or PDFs. Auto-crop removes backgrounds. Scan multiple pages into one document.</p>
       <div style={{ height:12 }} />
 
       <div
@@ -685,41 +756,81 @@ export default function App() {
         <div style={{ fontSize:14, fontWeight:500, color:"var(--dark)", marginBottom:4 }}>
           {dragging ? "Drop files here" : "Drop files or click to upload"}
         </div>
-        <div style={S.muted}>JPG · PNG · WEBP · PDF</div>
+        <div style={S.muted}>JPG · PNG · WEBP · PDF · Multi-page supported</div>
       </div>
       <input ref={fileInputRef} type="file" multiple accept="image/*,.pdf"
         style={{ display:"none" }} onChange={e => handleFiles(e.target.files)} />
 
       <div style={{ display:"flex", gap:8, marginTop:10 }}>
-        <button style={{ ...S.btn("default","sm"), flex:1 }}
+        <button style={{ ...S.btn("primary","sm"), flex:1 }}
           onClick={() => { camInputRef.current.setAttribute("capture","environment"); camInputRef.current?.click(); }}>
-          <Camera size={13} /> Camera
+          <Camera size={13} /> Scan Page
         </button>
         <button style={{ ...S.btn("default","sm"), flex:1 }}
           onClick={() => { camInputRef.current.removeAttribute("capture"); camInputRef.current?.click(); }}>
           <FilePlus size={13} /> Gallery
         </button>
       </div>
-      <input ref={camInputRef} type="file" accept="image/*"
+
+      {/* Multi-page info */}
+      <div style={{ marginTop:8, padding:"8px 12px", background:"var(--teal-xl)",
+                    borderRadius:"var(--radius-md)", border:"1px solid var(--teal-l)" }}>
+        <div style={{ fontSize:11, color:"var(--teal)", fontWeight:600, marginBottom:2 }}>
+          📄 Multi-page scanning
+        </div>
+        <div style={{ fontSize:11, color:"var(--gray)" }}>
+          Select multiple images at once from Gallery, or upload multiple files — they'll be combined into one document automatically.
+        </div>
+      </div>
+
+      {/* Auto-crop info */}
+      <div style={{ marginTop:6, padding:"8px 12px", background:"var(--light)",
+                    borderRadius:"var(--radius-md)", border:"1px solid var(--border)" }}>
+        <div style={{ fontSize:11, color:"var(--dark)", fontWeight:600, marginBottom:2 }}>
+          ✂️ Auto-crop enabled
+        </div>
+        <div style={{ fontSize:11, color:"var(--gray)" }}>
+          Document edges are automatically detected and backgrounds cropped before OCR.
+        </div>
+      </div>
+
+      <input ref={camInputRef} type="file" accept="image/*" multiple
         style={{ display:"none" }} onChange={e => handleFiles(e.target.files)} />
 
       {/* OCR options */}
       <div style={{ marginTop:16 }}>
         <div style={S.sideLabel}>OCR Engine</div>
-        <div style={{ display:"flex", gap:6, marginBottom:8 }}>
-          {["auto","backend","browser"].map(m => (
-            <button key={m} onClick={() => setOcrMode(m)}
-              style={{ ...S.btn(ocrMode===m?"teal_l":"default","sm"), flex:1, justifyContent:"center" }}>
-              {m==="auto"?<Sparkles size={11}/>:m==="backend"?<Globe size={11}/>:<Cpu size={11}/>}
-              {m.charAt(0).toUpperCase()+m.slice(1)}
+        <div style={{ display:"flex", gap:6, marginBottom:8, flexWrap:"wrap" }}>
+          {[
+            { id:"auto",    icon:<Sparkles size={11}/>, label:"Auto" },
+            { id:"mistral", icon:<Cpu size={11}/>,      label:"AI (Mistral)" },
+            { id:"backend", icon:<Globe size={11}/>,    label:"Tesseract" },
+            { id:"browser", icon:<Cpu size={11}/>,      label:"Browser" },
+          ].map(m => (
+            <button key={m.id} onClick={() => setOcrMode(m.id)}
+              style={{ ...S.btn(ocrMode===m.id?"teal_l":"default","sm"), flex:1, justifyContent:"center", minWidth:"40%" }}>
+              {m.icon} {m.label}
             </button>
           ))}
+        </div>
+        <div style={{ fontSize:10, color:"var(--gray)", marginBottom:8, padding:"6px 8px",
+                      background:"var(--light)", borderRadius:"var(--radius-sm)" }}>
+          {ocrMode==="auto" && "Uses Mistral AI if available, falls back to Tesseract"}
+          {ocrMode==="mistral" && "🤖 Mistral AI — best for tables, charts, mixed scripts"}
+          {ocrMode==="backend" && "Pytesseract — fast, works offline"}
+          {ocrMode==="browser" && "Tesseract.js — runs in your browser, no server"}
         </div>
         <div style={S.sideLabel}>Language</div>
         <select value={language} onChange={e=>setLanguage(e.target.value)}
           style={{ width:"100%", padding:"6px 10px", fontSize:12, borderRadius:"var(--radius-sm)",
                    border:"1px solid var(--border-d)", background:"var(--white)", color:"var(--dark)" }}>
           <option value="eng">English</option>
+          <option value="hin">Hindi — हिन्दी</option>
+          <option value="ben">Bengali — বাংলা</option>
+          <option value="asm">Assamese — অসমীয়া</option>
+          <option value="eng+hin">English + Hindi</option>
+          <option value="eng+ben">English + Bengali</option>
+          <option value="eng+asm">English + Assamese</option>
           <option value="fra">French</option>
           <option value="deu">German</option>
           <option value="spa">Spanish</option>
@@ -728,7 +839,6 @@ export default function App() {
           <option value="rus">Russian</option>
           <option value="chi_sim">Chinese (Simplified)</option>
           <option value="ara">Arabic</option>
-          <option value="hin">Hindi</option>
         </select>
       </div>
     </div>
@@ -857,7 +967,10 @@ export default function App() {
         {/* Mobile header */}
         <div style={{ ...S.header }}>
           <div style={S.logoBox}><ScanLine size={16} color="white" /></div>
-          <span style={S.logoText}>DocScan<span style={S.logoAccent}>Pro</span></span>
+          <div>
+            <span style={S.logoText}>DocScan<span style={S.logoAccent}>Pro</span></span>
+            <div style={{ fontSize:10, color:"var(--gray)" }}>by Sandeep Das, AAO, LGA, Assam</div>
+          </div>
           <div style={{ flex:1 }} />
           <StatusPill status={apiStatus} />
         </div>
@@ -915,8 +1028,13 @@ export default function App() {
           <Menu size={16} />
         </button>
         <div style={S.logoBox}><ScanLine size={16} color="white" /></div>
-        <span style={S.logoText}>DocScan<span style={S.logoAccent}>Pro</span></span>
-        <span style={{ ...S.badge("var(--teal)"), fontSize:9 }}>Audit Edition</span>
+        <div>
+          <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+            <span style={S.logoText}>DocScan<span style={S.logoAccent}>Pro</span></span>
+            <span style={{ ...S.badge("var(--teal)"), fontSize:9 }}>Audit Edition</span>
+          </div>
+          <div style={{ fontSize:10, color:"var(--gray)", marginTop:1 }}>by Sandeep Das, AAO, LGA, Assam</div>
+        </div>
         <div style={{ flex:1 }} />
         <StatusPill status={apiStatus} />
         <span style={{ fontSize:11, color:"var(--gray)" }}>
@@ -995,6 +1113,13 @@ export default function App() {
       </div>
 
       <Toast toasts={toasts} remove={removeToast} />
+
+      {/* Footer */}
+      <div style={{ padding:"8px 20px", borderTop:"1px solid var(--border)", background:"var(--white)",
+                    display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+        <span style={{ fontSize:10, color:"var(--gray)" }}>DocScanPro · Audit Edition</span>
+        <span style={{ fontSize:10, color:"var(--gray)" }}>by <strong>Sandeep Das</strong>, AAO, LGA, Assam</span>
+      </div>
     </div>
   );
 }

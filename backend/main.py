@@ -1,13 +1,14 @@
 """
-DocScanPro Backend — FastAPI
-Capabilities: pytesseract OCR, pdf2image, OCRmyPDF, python-docx, reportlab PDF
+DocScanPro Backend — FastAPI v3
+Capabilities: pytesseract OCR, Mistral AI OCR (tables/charts),
+              pdf2image, OCRmyPDF, python-docx, reportlab PDF
 """
 
 from fastapi import FastAPI, File, UploadFile, Form, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pathlib import Path
-import io, os, re, uuid, tempfile, datetime
+import io, os, re, uuid, tempfile, datetime, base64, httpx
 
 # ── Optional library imports ────────────────────────────────────────────────
 try:
@@ -33,30 +34,32 @@ try:
     from docx import Document as DocxDocument
     from docx.shared import Pt, RGBColor, Cm
     from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
     DOCX_AVAILABLE = True
 except ImportError:
     DOCX_AVAILABLE = False
 
 try:
     from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.units import cm
     from reportlab.lib import colors
     from reportlab.platypus import (
         SimpleDocTemplate, Paragraph, Spacer, PageBreak,
-        HRFlowable, KeepTogether, Table, TableStyle,
+        HRFlowable, Table, TableStyle,
     )
-    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+    from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
     REPORTLAB_AVAILABLE = True
 except ImportError:
     REPORTLAB_AVAILABLE = False
 
 # ── App ─────────────────────────────────────────────────────────────────────
-app = FastAPI(title="DocScanPro API", version="2.0.0")
+app = FastAPI(title="DocScanPro API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # Replace with your Pages URL in production
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,
@@ -64,10 +67,10 @@ app.add_middleware(
 
 TEMP_DIR = Path(tempfile.gettempdir()) / "docscanner"
 TEMP_DIR.mkdir(exist_ok=True)
-
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif", ".gif"}
+MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "")
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────────
 def tmp(suffix="") -> Path:
     return TEMP_DIR / f"{uuid.uuid4().hex}{suffix}"
 
@@ -79,16 +82,51 @@ def safe_name(s: str, max_len=60) -> str:
     return re.sub(r"[^a-zA-Z0-9_\-]", "_", s)[:max_len] or "document"
 
 
-# ── Structure detection ──────────────────────────────────────────────────────
+# ── Mistral AI OCR ────────────────────────────────────────────────────────────
+async def mistral_ocr(image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
+    if not MISTRAL_API_KEY:
+        raise ValueError("MISTRAL_API_KEY not set")
+
+    b64 = base64.b64encode(image_bytes).decode()
+    data_url = f"data:{mime_type};base64,{b64}"
+
+    payload = {
+        "model": "pixtral-12b-2409",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": data_url}},
+                {"type": "text", "text": (
+                    "You are a precise OCR engine for audit document processing. "
+                    "Extract ALL text from this document with perfect accuracy.\n\n"
+                    "RULES:\n"
+                    "1. TABLES: render as markdown tables using | separators with header rows\n"
+                    "2. CHARTS/GRAPHS: describe as [Chart: type, title, key values]\n"
+                    "3. FORMS: render as 'Field: Value' pairs\n"
+                    "4. Preserve ALL numbers, dates, amounts exactly\n"
+                    "5. Preserve headings, numbered lists, bullets\n"
+                    "6. Hindi/Bengali/Assamese: extract in original script\n"
+                    "7. Return ONLY extracted content — no commentary, no backticks"
+                )}
+            ]
+        }],
+        "max_tokens": 4096,
+        "temperature": 0,
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            "https://api.mistral.ai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"},
+            json=payload,
+        )
+        if not r.is_success:
+            raise ValueError(f"Mistral API error {r.status_code}: {r.text[:200]}")
+        return r.json()["choices"][0]["message"]["content"].strip()
+
+
+# ── Structure detection ───────────────────────────────────────────────────────
 def detect_structure(text: str) -> list[dict]:
-    """
-    Heuristically parse raw OCR text into a hierarchy:
-      level 0 = preamble (no heading)
-      level 1 = chapter   (CHAPTER X / PART X / ALL-CAPS ≥ 8 chars)
-      level 2 = section   (1. Title  or  SECTION X)
-      level 3 = subsection (1.1 Title)
-    Returns a list of section dicts with title, level, type, content.
-    """
     lines = text.split("\n")
     sections: list[dict] = []
     cur = {"title": "", "level": 0, "type": "preamble", "content": []}
@@ -100,111 +138,127 @@ def detect_structure(text: str) -> list[dict]:
             continue
 
         level, typ = None, None
-
-        # Level 1 — chapter keywords or ALL-CAPS headline
         if re.match(r"^(CHAPTER|PART|TITLE|APPENDIX)\s+[\dIVXivxa-z]", s, re.I):
             level, typ = 1, "chapter"
-        elif s.isupper() and 7 <= len(s) <= 90 and sum(c.isalpha() for c in s) > len(s) * 0.55:
+        elif re.match(r"^#{1,2}\s+\S", s):
             level, typ = 1, "chapter"
-
-        # Level 2 — numbered section or SECTION keyword
+        elif s.isupper() and 7 <= len(s) <= 90 and sum(c.isalpha() for c in s) > len(s)*0.55:
+            level, typ = 1, "chapter"
+        elif re.match(r"^#{3,4}\s+\S", s):
+            level, typ = 2, "section"
         elif re.match(r"^(SECTION|ARTICLE|CLAUSE)\s+\d", s, re.I):
             level, typ = 2, "section"
         elif re.match(r"^\d{1,2}[.)]\s+[A-Z]", s):
             level, typ = 2, "section"
-
-        # Level 3 — sub-section
         elif re.match(r"^\d{1,2}\.\d{1,3}[.):\s]", s):
             level, typ = 3, "subsection"
 
         if level is not None:
             if cur["title"] or cur["content"]:
                 sections.append(cur)
-            cur = {"title": s, "level": level, "type": typ, "content": []}
+            cur = {"title": re.sub(r"^#+\s+", "", s), "level": level, "type": typ, "content": []}
         else:
             cur["content"].append(s)
 
     if cur["title"] or cur["content"]:
         sections.append(cur)
-
     return sections
 
 
-# ── PDF builder (reportlab) ──────────────────────────────────────────────────
+# ── Markdown table parser ─────────────────────────────────────────────────────
+def parse_markdown_table(lines: list[str]) -> list[list[str]] | None:
+    rows = []
+    for line in lines:
+        if re.match(r"^\|[\s\-:|]+\|", line):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if cells:
+            rows.append(cells)
+    return rows if len(rows) >= 1 else None
+
+
+# ── PDF builder ───────────────────────────────────────────────────────────────
 def build_pdf(sections: list[dict], title: str, author: str, out: str):
-    TEAL   = colors.HexColor("#0F6E56")
-    TEAL_L = colors.HexColor("#D1FAE5")
-    DARK   = colors.HexColor("#111827")
-    GRAY   = colors.HexColor("#6B7280")
-    WHITE  = colors.white
+    TEAL    = colors.HexColor("#0F6E56")
+    TEAL_L  = colors.HexColor("#D1FAE5")
+    TEAL_XL = colors.HexColor("#F0FDF9")
+    DARK    = colors.HexColor("#111827")
+    GRAY    = colors.HexColor("#6B7280")
+    WHITE   = colors.white
 
     pw, ph = A4
     mg = 2.5 * cm
 
     def header_footer(canvas, doc):
         canvas.saveState()
-        canvas.setStrokeColor(TEAL)
-        canvas.setLineWidth(0.75)
-        canvas.line(mg, ph - mg + 0.4 * cm, pw - mg, ph - mg + 0.4 * cm)
+        canvas.setFillColor(TEAL)
+        canvas.rect(0, ph - 1.2*cm, pw, 1.2*cm, fill=1, stroke=0)
+        canvas.setFont("Helvetica-Bold", 8)
+        canvas.setFillColor(WHITE)
+        canvas.drawString(mg, ph - 0.8*cm, (title or "")[:60])
+        canvas.drawRightString(pw - mg, ph - 0.8*cm,
+                               datetime.date.today().strftime("%d %b %Y"))
+        canvas.setFillColor(TEAL_L)
+        canvas.rect(0, 0, pw, 1.0*cm, fill=1, stroke=0)
         canvas.setFont("Helvetica", 7)
-        canvas.setFillColor(GRAY)
-        canvas.drawString(mg, ph - mg + 0.6 * cm, title[:70])
-        canvas.drawRightString(pw - mg, ph - mg + 0.6 * cm,
-                               f"Generated {datetime.date.today().isoformat()}")
-        canvas.line(mg, 1.6 * cm, pw - mg, 1.6 * cm)
-        canvas.drawString(mg, 1.1 * cm, author or "DocScanPro")
-        canvas.drawRightString(pw - mg, 1.1 * cm, f"Page {doc.page}")
+        canvas.setFillColor(TEAL)
+        canvas.drawString(mg, 0.35*cm, author or "DocScanPro · Audit Edition")
+        canvas.drawRightString(pw - mg, 0.35*cm, f"Page {doc.page}")
         canvas.restoreState()
 
-    doc = SimpleDocTemplate(
+    pdf_doc = SimpleDocTemplate(
         out, pagesize=A4,
         leftMargin=mg, rightMargin=mg,
-        topMargin=mg + 0.8 * cm, bottomMargin=mg,
+        topMargin=mg + 0.5*cm, bottomMargin=mg + 0.2*cm,
         title=title, author=author or "DocScanPro",
-        subject="OCR Processed Document",
     )
 
-    # ── Styles ───────────────────────────────────────────────────────────────
-    cover_h   = ParagraphStyle("cover_h",   fontSize=30, fontName="Helvetica-Bold",
-                                textColor=TEAL,  alignment=TA_CENTER, spaceAfter=8)
+    # Styles
+    cover_h   = ParagraphStyle("cover_h",   fontSize=28, fontName="Helvetica-Bold",
+                                textColor=TEAL, alignment=TA_CENTER, spaceAfter=10)
     cover_sub = ParagraphStyle("cover_sub", fontSize=11, fontName="Helvetica",
-                                textColor=GRAY,  alignment=TA_CENTER, spaceAfter=4)
-    cover_tag = ParagraphStyle("cover_tag", fontSize=9,  fontName="Helvetica-Bold",
+                                textColor=GRAY, alignment=TA_CENTER, spaceAfter=4)
+    cover_tag = ParagraphStyle("cover_tag", fontSize=9, fontName="Helvetica-Bold",
                                 textColor=WHITE, backColor=TEAL, alignment=TA_CENTER,
                                 borderPad=8, spaceAfter=4)
-    ch_h      = ParagraphStyle("ch_h",  fontSize=20, fontName="Helvetica-Bold",
-                                textColor=TEAL,  spaceBefore=6,  spaceAfter=8)
+    ch_h      = ParagraphStyle("ch_h",  fontSize=18, fontName="Helvetica-Bold",
+                                textColor=TEAL, spaceBefore=6, spaceAfter=8)
     sec_h     = ParagraphStyle("sec_h", fontSize=13, fontName="Helvetica-Bold",
-                                textColor=DARK,  spaceBefore=14, spaceAfter=6)
+                                textColor=DARK, spaceBefore=12, spaceAfter=5)
     sub_h     = ParagraphStyle("sub_h", fontSize=11, fontName="Helvetica-Bold",
                                 textColor=colors.HexColor("#374151"),
-                                spaceBefore=10, spaceAfter=4)
+                                spaceBefore=8, spaceAfter=3)
     body      = ParagraphStyle("body",  fontSize=9.5, fontName="Helvetica",
-                                textColor=DARK,  leading=15, spaceAfter=5,
+                                textColor=DARK, leading=15, spaceAfter=4,
                                 alignment=TA_JUSTIFY)
-    toc_ch    = ParagraphStyle("toc_ch",  fontSize=11, fontName="Helvetica-Bold",
-                                textColor=DARK,  spaceBefore=5, spaceAfter=1)
+    bullet_s  = ParagraphStyle("bullet", fontSize=9.5, fontName="Helvetica",
+                                textColor=DARK, leading=14, spaceAfter=2,
+                                leftIndent=14)
+    chart_cap = ParagraphStyle("chart_cap", fontSize=9, fontName="Helvetica-Oblique",
+                                textColor=GRAY, alignment=TA_CENTER, spaceAfter=8)
+    toc_ch    = ParagraphStyle("toc_ch", fontSize=11, fontName="Helvetica-Bold",
+                                textColor=DARK, spaceBefore=5, spaceAfter=1)
     toc_sec   = ParagraphStyle("toc_sec", fontSize=10, fontName="Helvetica",
-                                textColor=GRAY,  leftIndent=14, spaceAfter=1)
-    toc_sub   = ParagraphStyle("toc_sub", fontSize=9,  fontName="Helvetica",
-                                textColor=GRAY,  leftIndent=28, spaceAfter=1)
+                                textColor=GRAY, leftIndent=14, spaceAfter=1)
+    toc_sub   = ParagraphStyle("toc_sub", fontSize=9, fontName="Helvetica",
+                                textColor=GRAY, leftIndent=28, spaceAfter=1)
 
     story = []
 
-    # ── Cover ─────────────────────────────────────────────────────────────────
-    story.append(Spacer(1, 4 * cm))
-    story.append(HRFlowable(width="100%", thickness=4, color=TEAL, spaceAfter=24))
+    # Cover
+    story.append(Spacer(1, 3.5*cm))
+    story.append(HRFlowable(width="100%", thickness=4, color=TEAL, spaceAfter=20))
     story.append(Paragraph(title or "Untitled Document", cover_h))
-    story.append(HRFlowable(width="100%", thickness=1, color=TEAL_L, spaceAfter=20))
+    story.append(HRFlowable(width="100%", thickness=1, color=TEAL_L, spaceAfter=18))
     if author:
         story.append(Paragraph(f"Prepared by: {author}", cover_sub))
     story.append(Paragraph(
         datetime.datetime.now().strftime("Generated: %B %d, %Y at %H:%M"), cover_sub))
-    story.append(Spacer(1, 0.8 * cm))
+    story.append(Spacer(1, 0.6*cm))
     story.append(Paragraph("OCR PROCESSED — AUDIT DOCUMENT", cover_tag))
     story.append(PageBreak())
 
-    # ── Table of Contents ────────────────────────────────────────────────────
+    # TOC
     toc_entries = [(s["title"], s["level"]) for s in sections if s.get("title")]
     if toc_entries:
         story.append(Paragraph("Table of Contents", ch_h))
@@ -222,21 +276,73 @@ def build_pdf(sections: list[dict], title: str, author: str, out: str):
                 story.append(Paragraph(f"{ch_n}.{sec_n}.{sub_n}  {ttl}", toc_sub))
         story.append(PageBreak())
 
-    # ── Content ───────────────────────────────────────────────────────────────
-    def flush_para(buf):
-        txt = " ".join(buf).strip()
-        if txt:
-            story.append(Paragraph(txt, body))
+    def make_table(rows):
+        max_cols = max(len(r) for r in rows)
+        norm = [r + [""] * (max_cols - len(r)) for r in rows]
+        cs  = ParagraphStyle("cs",  fontSize=8.5, fontName="Helvetica", leading=12, textColor=DARK)
+        hs  = ParagraphStyle("hs",  fontSize=8.5, fontName="Helvetica-Bold", leading=12, textColor=WHITE)
+        td  = [[Paragraph(str(c).replace("&","&amp;").replace("<","&lt;"),
+                          hs if ri==0 else cs) for c in r] for ri, r in enumerate(norm)]
+        cw  = (pw - mg*2) / max_cols
+        t   = Table(td, colWidths=[cw]*max_cols, repeatRows=1)
+        t.setStyle(TableStyle([
+            ("BACKGROUND",   (0,0),(-1,0),  TEAL),
+            ("FONTNAME",     (0,0),(-1,0),  "Helvetica-Bold"),
+            ("BOTTOMPADDING",(0,0),(-1,0),  7),
+            ("TOPPADDING",   (0,0),(-1,0),  7),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE, TEAL_XL]),
+            ("FONTSIZE",     (0,1),(-1,-1),  8.5),
+            ("TOPPADDING",   (0,1),(-1,-1),  5),
+            ("BOTTOMPADDING",(0,1),(-1,-1),  5),
+            ("LEFTPADDING",  (0,0),(-1,-1),  6),
+            ("RIGHTPADDING", (0,0),(-1,-1),  6),
+            ("GRID",         (0,0),(-1,-1),  0.4, colors.HexColor("#D1D5DB")),
+            ("BOX",          (0,0),(-1,-1),  0.8, TEAL),
+            ("VALIGN",       (0,0),(-1,-1),  "MIDDLE"),
+        ]))
+        return t
+
+    def render_block(lines):
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if not line.strip():
+                story.append(Spacer(1, 3)); i += 1; continue
+
+            if line.strip().startswith("|"):
+                tb = []
+                while i < len(lines) and lines[i].strip().startswith("|"):
+                    tb.append(lines[i]); i += 1
+                rows = parse_markdown_table(tb)
+                if rows:
+                    story.append(make_table(rows))
+                    story.append(Spacer(1, 6))
+                continue
+
+            if re.match(r"^\[?(chart|graph|figure|diagram)\b", line, re.I):
+                story.append(Paragraph(f"📊 {line}", chart_cap)); i += 1; continue
+
+            if re.match(r"^[\-\*•]\s+", line):
+                txt = re.sub(r"^[\-\*•]\s+", "", line)
+                story.append(Paragraph(f"• {txt}", bullet_s)); i += 1; continue
+
+            if re.match(r"^\d+[.)]\s+", line):
+                story.append(Paragraph(line, bullet_s)); i += 1; continue
+
+            buf = []
+            while i < len(lines) and lines[i].strip() and \
+                  not lines[i].strip().startswith("|") and \
+                  not re.match(r"^[\-\*•\d]", lines[i]):
+                buf.append(lines[i].strip()); i += 1
+            if buf:
+                txt = " ".join(buf).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+                story.append(Paragraph(txt, body))
 
     for i, sec in enumerate(sections):
-        lvl   = sec.get("level", 0)
-        title_ = sec.get("title", "")
-        lines = sec.get("content", [])
-
+        lvl, title_, lines = sec.get("level",0), sec.get("title",""), sec.get("content",[])
         if title_:
             if lvl <= 1:
-                if i > 0:
-                    story.append(PageBreak())
+                if i > 0: story.append(PageBreak())
                 story.append(HRFlowable(width="100%", thickness=2, color=TEAL, spaceAfter=4))
                 story.append(Paragraph(title_, ch_h))
                 story.append(HRFlowable(width="100%", thickness=0.5, color=TEAL_L, spaceAfter=6))
@@ -244,92 +350,81 @@ def build_pdf(sections: list[dict], title: str, author: str, out: str):
                 story.append(Paragraph(title_, sec_h))
             else:
                 story.append(Paragraph(title_, sub_h))
+        render_block(lines)
 
-        buf = []
-        for line in lines:
-            if line:
-                buf.append(line)
-            else:
-                flush_para(buf)
-                buf = []
-                story.append(Spacer(1, 4))
-        flush_para(buf)
-
-    doc.build(story, onFirstPage=header_footer, onLaterPages=header_footer)
+    pdf_doc.build(story, onFirstPage=header_footer, onLaterPages=header_footer)
 
 
-# ── DOCX builder (python-docx) ───────────────────────────────────────────────
+# ── DOCX builder ─────────────────────────────────────────────────────────────
 def build_docx(sections: list[dict], title: str, author: str, out: str):
     doc = DocxDocument()
-
     for sec in doc.sections:
-        sec.top_margin    = Cm(2.5)
-        sec.bottom_margin = Cm(2.5)
-        sec.left_margin   = Cm(3.0)
-        sec.right_margin  = Cm(2.5)
+        sec.top_margin=Cm(2.5); sec.bottom_margin=Cm(2.5)
+        sec.left_margin=Cm(3.0); sec.right_margin=Cm(2.5)
 
-    TEAL_RGB = RGBColor(0x0F, 0x6E, 0x56)
-    GRAY_RGB = RGBColor(0x6B, 0x72, 0x80)
+    TEAL_RGB  = RGBColor(0x0F, 0x6E, 0x56)
+    GRAY_RGB  = RGBColor(0x6B, 0x72, 0x80)
+    WHITE_RGB = RGBColor(0xFF, 0xFF, 0xFF)
 
-    # Cover
     h = doc.add_heading(title or "Untitled Document", 0)
     h.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    h.runs[0].font.color.rgb = TEAL_RGB
+    if h.runs: h.runs[0].font.color.rgb = TEAL_RGB
 
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     r = p.add_run(datetime.datetime.now().strftime("Generated: %B %d, %Y"))
-    r.font.color.rgb = GRAY_RGB
-    r.font.size = Pt(10)
-
+    r.font.color.rgb = GRAY_RGB; r.font.size = Pt(10)
     if author:
-        pa = doc.add_paragraph()
-        pa.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        pa = doc.add_paragraph(); pa.alignment = WD_ALIGN_PARAGRAPH.CENTER
         ra = pa.add_run(f"Prepared by: {author}")
-        ra.font.color.rgb = GRAY_RGB
-        ra.font.size = Pt(10)
+        ra.font.color.rgb = GRAY_RGB; ra.font.size = Pt(10)
 
     doc.add_page_break()
-
-    # TOC placeholder
-    toc_para = doc.add_paragraph("Table of Contents")
-    toc_para.style = "Heading 1"
-    toc_para.runs[0].font.color.rgb = TEAL_RGB
-    doc.add_paragraph("[Update table of contents in Word: References → Update Table]") \
-       .runs[0].italic = True
+    tp = doc.add_paragraph("Table of Contents"); tp.style = "Heading 1"
+    if tp.runs: tp.runs[0].font.color.rgb = TEAL_RGB
+    doc.add_paragraph("[Update TOC: References → Update Table]").runs[0].italic = True
     doc.add_page_break()
 
-    def flush(buf):
-        txt = " ".join(buf).strip()
-        if txt:
-            doc.add_paragraph(txt)
+    def add_table(rows):
+        if not rows: return
+        mc = max(len(r) for r in rows)
+        norm = [r + [""]*( mc-len(r)) for r in rows]
+        t = doc.add_table(rows=len(norm), cols=mc); t.style = "Table Grid"
+        for ri, row in enumerate(norm):
+            for ci, ct in enumerate(row):
+                cell = t.cell(ri, ci); cell.text = str(ct)
+                run = cell.paragraphs[0].runs[0] if cell.paragraphs[0].runs \
+                      else cell.paragraphs[0].add_run(str(ct))
+                if ri == 0:
+                    run.font.bold = True; run.font.color.rgb = WHITE_RGB
+                    tc = cell._tc; tcPr = tc.get_or_add_tcPr()
+                    shd = OxmlElement("w:shd")
+                    shd.set(qn("w:val"),"clear"); shd.set(qn("w:color"),"auto")
+                    shd.set(qn("w:fill"),"0F6E56"); tcPr.append(shd)
+        doc.add_paragraph()
 
     for i, sec in enumerate(sections):
-        lvl    = sec.get("level", 0)
-        title_ = sec.get("title", "")
-        lines  = sec.get("content", [])
-
+        lvl, title_, lines = sec.get("level",0), sec.get("title",""), sec.get("content",[])
         if title_:
-            h_lvl = min(max(lvl, 1), 4)
-            h = doc.add_heading(title_, level=h_lvl)
-            if lvl <= 1:
-                h.runs[0].font.color.rgb = TEAL_RGB
-            if lvl <= 1 and i > 0:
-                doc.add_page_break()
-
-        buf = []
-        for line in lines:
-            if line:
-                buf.append(line)
+            hh = doc.add_heading(title_, level=min(max(lvl,1),4))
+            if hh.runs and lvl<=1: hh.runs[0].font.color.rgb = TEAL_RGB
+            if lvl<=1 and i>0: doc.add_page_break()
+        j = 0
+        while j < len(lines):
+            line = lines[j]
+            if line.strip().startswith("|"):
+                tb = []
+                while j < len(lines) and lines[j].strip().startswith("|"):
+                    tb.append(lines[j]); j += 1
+                rows = parse_markdown_table(tb)
+                if rows: add_table(rows)
+            elif line.strip():
+                doc.add_paragraph(line.strip()); j += 1
             else:
-                flush(buf)
-                buf = []
-        flush(buf)
-
+                j += 1
     doc.save(out)
 
 
-# ── Endpoints ────────────────────────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
 def health():
@@ -337,6 +432,7 @@ def health():
         "status": "ok",
         "capabilities": {
             "ocr_pytesseract": OCR_AVAILABLE,
+            "ocr_mistral":     bool(MISTRAL_API_KEY),
             "pdf2image":       PDF2IMAGE_AVAILABLE,
             "ocrmypdf":        OCRMYPDF_AVAILABLE,
             "docx_export":     DOCX_AVAILABLE,
@@ -347,125 +443,100 @@ def health():
 
 @app.post("/api/ocr")
 async def ocr(
-    file: UploadFile = File(...),
-    language: str    = Form("eng"),
+    file:     UploadFile = File(...),
+    language: str        = Form("eng"),
+    engine:   str        = Form("auto"),
 ):
-    """OCR an image or PDF. Returns text + structural sections."""
-    if not OCR_AVAILABLE:
-        raise HTTPException(500, "pytesseract / Pillow not installed")
-
     data = await file.read()
     ext  = Path(file.filename or "").suffix.lower()
+    use_mistral = engine == "mistral" or (engine == "auto" and bool(MISTRAL_API_KEY))
 
-    images: list = []
-
+    images_bytes: list[bytes] = []
     if ext == ".pdf":
         if not PDF2IMAGE_AVAILABLE:
-            raise HTTPException(400, "pdf2image not available — install poppler-utils")
-        images = convert_from_bytes(data, dpi=200, fmt="jpeg")
-    elif ext in IMAGE_EXTS or file.content_type.startswith("image/"):
-        img = Image.open(io.BytesIO(data))
-        images = [img]
+            raise HTTPException(400, "pdf2image not available")
+        for img in convert_from_bytes(data, dpi=200, fmt="jpeg"):
+            buf = io.BytesIO(); img.save(buf, "JPEG", quality=92)
+            images_bytes.append(buf.getvalue())
+    elif ext in IMAGE_EXTS or (file.content_type or "").startswith("image/"):
+        images_bytes = [data]
     else:
-        raise HTTPException(400, f"Unsupported type: {ext or file.content_type}")
+        raise HTTPException(400, f"Unsupported: {ext}")
 
     page_texts = []
-    for i, img in enumerate(images):
-        if img.mode not in ("RGB", "L", "RGBA"):
-            img = img.convert("RGB")
-        text = pytesseract.image_to_string(img, lang=language)
-        page_texts.append({"page": i + 1, "text": text.strip()})
+    for i, img_bytes in enumerate(images_bytes):
+        if use_mistral:
+            try:
+                text = await mistral_ocr(img_bytes)
+            except Exception:
+                if OCR_AVAILABLE:
+                    img = Image.open(io.BytesIO(img_bytes))
+                    if img.mode not in ("RGB","L"): img = img.convert("RGB")
+                    text = pytesseract.image_to_string(img, lang=language)
+                else:
+                    text = "[OCR unavailable]"
+        else:
+            if not OCR_AVAILABLE:
+                raise HTTPException(500, "pytesseract not installed")
+            img = Image.open(io.BytesIO(img_bytes))
+            if img.mode not in ("RGB","L","RGBA"): img = img.convert("RGB")
+            text = pytesseract.image_to_string(img, lang=language)
+        page_texts.append({"page": i+1, "text": text.strip()})
 
     full_text = "\n\n--- Page Break ---\n\n".join(p["text"] for p in page_texts)
     sections  = detect_structure(full_text)
 
     return JSONResponse({
-        "text":       full_text,
-        "pages":      len(images),
-        "page_texts": page_texts,
-        "sections":   sections,
+        "text": full_text, "pages": len(images_bytes),
+        "page_texts": page_texts, "sections": sections,
         "word_count": len(full_text.split()),
         "char_count": len(full_text),
+        "engine_used": "mistral" if use_mistral else "tesseract",
     })
 
 
 @app.post("/api/export/pdf")
-async def export_pdf(
-    background_tasks: BackgroundTasks,
-    text:   str = Form(...),
-    title:  str = Form("Document"),
-    author: str = Form(""),
-):
-    if not REPORTLAB_AVAILABLE:
-        raise HTTPException(500, "reportlab not installed")
+async def export_pdf(background_tasks: BackgroundTasks,
+                     text: str=Form(...), title: str=Form("Document"), author: str=Form("")):
+    if not REPORTLAB_AVAILABLE: raise HTTPException(500, "reportlab not installed")
     sections = detect_structure(text)
-    out = tmp(".pdf")
-    build_pdf(sections, title, author, str(out))
+    out = tmp(".pdf"); build_pdf(sections, title, author, str(out))
     background_tasks.add_task(rm, str(out))
     return FileResponse(str(out), media_type="application/pdf",
                         filename=f"{safe_name(title)}.pdf")
 
 
 @app.post("/api/export/docx")
-async def export_docx(
-    background_tasks: BackgroundTasks,
-    text:   str = Form(...),
-    title:  str = Form("Document"),
-    author: str = Form(""),
-):
-    if not DOCX_AVAILABLE:
-        raise HTTPException(500, "python-docx not installed")
+async def export_docx(background_tasks: BackgroundTasks,
+                      text: str=Form(...), title: str=Form("Document"), author: str=Form("")):
+    if not DOCX_AVAILABLE: raise HTTPException(500, "python-docx not installed")
     sections = detect_structure(text)
-    out = tmp(".docx")
-    build_docx(sections, title, author, str(out))
+    out = tmp(".docx"); build_docx(sections, title, author, str(out))
     background_tasks.add_task(rm, str(out))
-    return FileResponse(
-        str(out),
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        filename=f"{safe_name(title)}.docx",
-    )
+    return FileResponse(str(out),
+                        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        filename=f"{safe_name(title)}.docx")
 
 
 @app.post("/api/export/txt")
-async def export_txt(
-    background_tasks: BackgroundTasks,
-    text:  str = Form(...),
-    title: str = Form("Document"),
-):
+async def export_txt(background_tasks: BackgroundTasks,
+                     text: str=Form(...), title: str=Form("Document")):
     out = tmp(".txt")
-    header = (
-        f"{'='*70}\n"
-        f"  {title}\n"
-        f"  Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-        f"{'='*70}\n\n"
-    )
+    header = f"{'='*70}\n  {title}\n  Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n{'='*70}\n\n"
     out.write_text(header + text, encoding="utf-8")
     background_tasks.add_task(rm, str(out))
-    return FileResponse(str(out), media_type="text/plain",
-                        filename=f"{safe_name(title)}.txt")
+    return FileResponse(str(out), media_type="text/plain", filename=f"{safe_name(title)}.txt")
 
 
 @app.post("/api/ocrmypdf")
-async def make_searchable(
-    background_tasks: BackgroundTasks,
-    file:     UploadFile = File(...),
-    language: str        = Form("eng"),
-):
-    """Run OCRmyPDF on an uploaded PDF/image to create a searchable PDF."""
-    if not OCRMYPDF_AVAILABLE:
-        raise HTTPException(500, "ocrmypdf not installed")
-
+async def make_searchable(background_tasks: BackgroundTasks,
+                          file: UploadFile=File(...), language: str=Form("eng")):
+    if not OCRMYPDF_AVAILABLE: raise HTTPException(500, "ocrmypdf not installed")
     data = await file.read()
     ext  = Path(file.filename or "").suffix.lower() or ".pdf"
-    inp  = tmp(ext)
-    out  = tmp("_searchable.pdf")
+    inp  = tmp(ext); out = tmp("_searchable.pdf")
     inp.write_bytes(data)
-
-    ocrmypdf.ocr(str(inp), str(out), language=language,
-                 skip_text=True, deskew=True, clean=True)
-
-    background_tasks.add_task(rm, str(inp))
-    background_tasks.add_task(rm, str(out))
-    fname = Path(file.filename or "searchable").stem
+    ocrmypdf.ocr(str(inp), str(out), language=language, skip_text=True, deskew=True, clean=True)
+    background_tasks.add_task(rm, str(inp)); background_tasks.add_task(rm, str(out))
     return FileResponse(str(out), media_type="application/pdf",
-                        filename=f"{safe_name(fname)}_searchable.pdf")
+                        filename=f"{safe_name(Path(file.filename or 'doc').stem)}_searchable.pdf")
