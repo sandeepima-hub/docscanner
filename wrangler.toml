@@ -1,0 +1,7 @@
+name = "docscanner"
+compatibility_date = "2024-09-23"
+pages_build_output_dir = "frontend/dist"
+
+[vars]
+# Set this to your backend URL after deploying the Python API
+# VITE_API_URL = "https://your-backend.railway.app"
