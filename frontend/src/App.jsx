@@ -282,13 +282,14 @@ function StatusPill({ status }) {
   const map = {
     ok:       { color:"var(--teal)",    label:"Backend connected" },
     offline:  { color:"var(--warn)",    label:"Offline — browser OCR" },
+    waking:   { color:"var(--warn)",    label:"Waking up… (30s)" },
     checking: { color:"var(--gray)",    label:"Checking API…" },
     error:    { color:"var(--danger)",  label:"API error" },
   };
   const { color, label } = map[status] || map.checking;
   return (
     <div style={{ display:"flex", alignItems:"center", gap:5, fontSize:11, color:"var(--gray)" }}>
-      <div style={{ ...S.dot(color), animation: status==="checking"?"pulse 1.5s infinite":undefined }} />
+      <div style={{ ...S.dot(color), animation: (status==="checking"||status==="waking")?"pulse 1.5s infinite":undefined }} />
       {label}
     </div>
   );
@@ -558,18 +559,86 @@ function FileItem({ item, active, onClick, onDelete }) {
   );
 }
 
+// ─── Scan to PDF (client-side, like Adobe Scan) ──────────────────────────────
+async function scanPagesToPDF(pages) {
+  // Load jsPDF dynamically
+  if (!window.jspdf) {
+    await new Promise((res, rej) => {
+      const s = document.createElement("script");
+      s.src = "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js";
+      s.onload = res; s.onerror = rej;
+      document.head.appendChild(s);
+    });
+  }
+  const { jsPDF } = window.jspdf;
+  const pdf = new jsPDF({ unit:"mm", format:"a4", orientation:"portrait" });
+  const pW  = pdf.internal.pageSize.getWidth();
+  const pH  = pdf.internal.pageSize.getHeight();
+
+  for (let i = 0; i < pages.length; i++) {
+    if (i > 0) pdf.addPage();
+    const dataURL = pages[i];
+
+    // Get image dimensions to fit A4
+    await new Promise(res => {
+      const img = new Image();
+      img.onload = () => {
+        const ratio  = Math.min(pW / img.width, pH / img.height);
+        const imgW   = img.width  * ratio;
+        const imgH   = img.height * ratio;
+        const x      = (pW - imgW) / 2;
+        const y      = (pH - imgH) / 2;
+        pdf.addImage(dataURL, "JPEG", x, y, imgW, imgH);
+        res();
+      };
+      img.src = dataURL;
+    });
+  }
+  return pdf;
+}
+
+// ─── Persist docs to localStorage ────────────────────────────────────────────
+const STORAGE_KEY = "docscanner_library_v1";
+
+function saveLibrary(docs) {
+  try {
+    // Don't save rawFile (not serializable), save thumb + text only
+    const serializable = docs.map(d => ({
+      ...d,
+      rawFile: null,
+      // Limit thumb size for storage
+      thumb: d.thumb ? d.thumb.substring(0, 50000) : null,
+    }));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(serializable));
+  } catch (e) {
+    console.warn("Could not save to localStorage:", e);
+  }
+}
+
+function loadLibrary() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
-  const [docs,       setDocs]       = useState([]);   // processed docs
-  const [activeId,   setActiveId]   = useState(null); // currently viewed doc id
+  const [docs,       setDocs]       = useState(() => loadLibrary());
+  const [activeId,   setActiveId]   = useState(null);
   const [apiStatus,  setApiStatus]  = useState("checking");
   const [toasts,     setToasts]     = useState([]);
-  const [sideOpen,   setSideOpen]   = useState(true);  // desktop sidebar
-  const [mobileTab,  setMobileTab]  = useState("upload");
+  const [sideOpen,   setSideOpen]   = useState(true);
+  const [mobileTab,  setMobileTab]  = useState("scan");
   const [showText,   setShowText]   = useState(true);
   const [dragging,   setDragging]   = useState(false);
-  const [ocrMode,    setOcrMode]    = useState("auto"); // auto | backend | browser
+  const [ocrMode,    setOcrMode]    = useState("auto");
   const [language,   setLanguage]   = useState("eng");
+  // Scan session — multiple pages before finalising
+  const [scanPages,  setScanPages]  = useState([]); // array of dataURLs
+  const [scanBusy,   setScanBusy]   = useState(false);
 
   const fileInputRef  = useRef(null);
   const camInputRef   = useRef(null);
@@ -584,15 +653,20 @@ export default function App() {
   }, []);
   const removeToast = (id) => setToasts(t => t.filter(x => x.id !== id));
 
+  // ── Auto-save library to localStorage ────────────────────────────────────
+  useEffect(() => {
+    saveLibrary(docs);
+  }, [docs]);
+
   // ── Check backend health ─────────────────────────────────────────────────
   useEffect(() => {
     const check = async () => {
       try {
-        const r = await fetch(`${API}/api/health`, { signal: AbortSignal.timeout(4000) });
+        // Show "waking" if currently offline (Railway cold start)
+        setApiStatus(s => s === "offline" ? "waking" : s);
+        const r = await fetch(`${API}/api/health`, { signal: AbortSignal.timeout(12000) });
         if (r.ok) {
-          const data = await r.json();
           setApiStatus("ok");
-          console.info("Backend capabilities:", data.capabilities);
         } else {
           setApiStatus("error");
         }
@@ -601,7 +675,8 @@ export default function App() {
       }
     };
     check();
-    const t = setInterval(check, 30000);
+    // Ping every 10 min to prevent Railway sleeping
+    const t = setInterval(check, 10 * 60 * 1000);
     return () => clearInterval(t);
   }, []);
 
@@ -951,14 +1026,142 @@ export default function App() {
   };
 
   // ─────────────────────────────────────────────────────────────────────────
+  // SCAN SESSION UI — multi-page scan like Adobe Scan
+  // ─────────────────────────────────────────────────────────────────────────
+  const scanInputRef = useRef(null);
+
+  const addScanPage = async (file) => {
+    const raw = await toDataURL(file);
+    const cropped = await autoCropImage(raw);
+    setScanPages(p => [...p, cropped]);
+  };
+
+  const removeScanPage = (idx) => setScanPages(p => p.filter((_, i) => i !== idx));
+
+  const saveScanAsPDF = async (runOCR = false) => {
+    if (scanPages.length === 0) return;
+    setScanBusy(true);
+    try {
+      const pdf = await scanPagesToPDF(scanPages);
+      const title = `Scan_${new Date().toLocaleDateString("en-GB").replace(/\//g,"-")}`;
+      pdf.save(`${title}.pdf`);
+
+      if (runOCR) {
+        // Also process with OCR
+        for (const pageDataURL of scanPages) {
+          const res = await fetch(pageDataURL);
+          const blob = await res.blob();
+          const file = new File([blob], `${title}.jpg`, { type:"image/jpeg" });
+          await processFile(file);
+        }
+        notify("PDF saved & OCR started!", "ok");
+        if (isMobile) setMobileTab("result");
+      } else {
+        notify(`PDF saved — ${scanPages.length} page(s)!`, "ok");
+      }
+      setScanPages([]);
+    } catch (e) {
+      notify(`Failed: ${e.message}`, "error");
+    } finally {
+      setScanBusy(false);
+    }
+  };
+
+  const ScanSession = () => (
+    <div style={{ padding:"0 0 16px" }}>
+      <p style={S.muted}>Scan multiple pages — auto-cropped. Save as PDF or run OCR.</p>
+      <div style={{ height:10 }} />
+
+      {/* Page thumbnails */}
+      {scanPages.length > 0 && (
+        <div style={{ display:"flex", gap:8, overflowX:"auto", paddingBottom:8, marginBottom:12 }}>
+          {scanPages.map((src, idx) => (
+            <div key={idx} style={{ position:"relative", flexShrink:0 }}>
+              <img src={src} alt={`Page ${idx+1}`} style={{
+                width:80, height:110, objectFit:"cover",
+                borderRadius:"var(--radius-md)", border:"2px solid var(--teal)",
+              }} />
+              <div style={{ position:"absolute", top:2, left:4,
+                            background:"var(--teal)", color:"#fff",
+                            fontSize:10, fontWeight:700, padding:"1px 5px",
+                            borderRadius:4 }}>
+                {idx+1}
+              </div>
+              <button onClick={() => removeScanPage(idx)} style={{
+                position:"absolute", top:2, right:2,
+                background:"rgba(0,0,0,0.6)", border:"none", borderRadius:"50%",
+                width:20, height:20, cursor:"pointer", color:"#fff",
+                display:"flex", alignItems:"center", justifyContent:"center",
+              }}>
+                <X size={10} />
+              </button>
+            </div>
+          ))}
+          {/* Add page button */}
+          <button onClick={() => { scanInputRef.current.setAttribute("capture","environment"); scanInputRef.current?.click(); }}
+            style={{ width:80, height:110, flexShrink:0, borderRadius:"var(--radius-md)",
+                     border:"2px dashed var(--teal)", background:"var(--teal-xl)",
+                     cursor:"pointer", display:"flex", flexDirection:"column",
+                     alignItems:"center", justifyContent:"center", gap:4, color:"var(--teal)" }}>
+            <Plus size={20} />
+            <span style={{ fontSize:10, fontWeight:600 }}>Add page</span>
+          </button>
+        </div>
+      )}
+
+      {/* Scan button */}
+      {scanPages.length === 0 && (
+        <button onClick={() => { scanInputRef.current.setAttribute("capture","environment"); scanInputRef.current?.click(); }}
+          style={{ ...S.btn("primary","lg"), width:"100%", justifyContent:"center", marginBottom:10 }}>
+          <Camera size={18} /> Scan First Page
+        </button>
+      )}
+
+      {/* Action buttons */}
+      {scanPages.length > 0 && (
+        <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+          <div style={{ fontSize:12, color:"var(--teal)", fontWeight:600, textAlign:"center" }}>
+            {scanPages.length} page{scanPages.length!==1?"s":""} scanned
+          </div>
+          <button onClick={() => saveScanAsPDF(false)} disabled={scanBusy}
+            style={{ ...S.btn("primary","md"), width:"100%", justifyContent:"center" }}>
+            {scanBusy ? <Spinner size={14}/> : <Download size={14}/>}
+            Save as PDF (no OCR)
+          </button>
+          <button onClick={() => saveScanAsPDF(true)} disabled={scanBusy}
+            style={{ ...S.btn("teal_l","md"), width:"100%", justifyContent:"center" }}>
+            {scanBusy ? <Spinner size={14}/> : <ScanLine size={14}/>}
+            Save PDF + Run OCR
+          </button>
+          <button onClick={() => setScanPages([])} style={{ ...S.btn("default","sm"), width:"100%", justifyContent:"center" }}>
+            <RotateCcw size={12}/> Start over
+          </button>
+        </div>
+      )}
+
+      <input ref={scanInputRef} type="file" accept="image/*" capture="environment"
+        style={{ display:"none" }} onChange={e => { if(e.target.files[0]) addScanPage(e.target.files[0]); e.target.value=""; }} />
+
+      {/* Also allow gallery */}
+      <div style={{ marginTop:12 }}>
+        <button onClick={() => { scanInputRef.current.removeAttribute("capture"); scanInputRef.current?.click(); }}
+          style={{ ...S.btn("default","sm"), width:"100%", justifyContent:"center" }}>
+          <FilePlus size={13}/> Add from Gallery
+        </button>
+      </div>
+    </div>
+  );
+
+  // ─────────────────────────────────────────────────────────────────────────
   // MOBILE layout
   // ─────────────────────────────────────────────────────────────────────────
   if (isMobile) {
     const tabs = [
-      { id:"upload",  icon:<Upload size={18}/>,    label:"Upload" },
-      { id:"library", icon:<Layers size={18}/>,    label:"Docs" },
-      { id:"result",  icon:<BookOpen size={18}/>,  label:"Results" },
-      { id:"export",  icon:<Download size={18}/>,  label:"Export" },
+      { id:"scan",    icon:<Camera size={18}/>,   label:"Scan" },
+      { id:"upload",  icon:<Upload size={18}/>,   label:"Upload" },
+      { id:"library", icon:<Layers size={18}/>,   label:"Docs" },
+      { id:"result",  icon:<BookOpen size={18}/>, label:"Results" },
+      { id:"export",  icon:<Download size={18}/>, label:"Export" },
     ];
     return (
       <div style={{ ...S.app, maxWidth:480, margin:"0 auto" }}>
@@ -977,6 +1180,7 @@ export default function App() {
 
         {/* Content */}
         <div style={{ flex:1, overflowY:"auto", padding:16 }}>
+          {mobileTab==="scan"    && <ScanSession />}
           {mobileTab==="upload"  && <UploadZone />}
           {mobileTab==="library" && (
             docs.length===0
@@ -1049,7 +1253,10 @@ export default function App() {
         {sideOpen && (
           <aside style={S.sidebar}>
             <div style={{ padding:"16px 16px 8px" }}>
-              <div style={S.sideLabel}>Upload &amp; Scan</div>
+              <div style={S.sideLabel}>📷 Scan Pages</div>
+              <ScanSession />
+              <div style={{ height:12 }} />
+              <div style={S.sideLabel}>Upload &amp; OCR</div>
               <UploadZone />
             </div>
 
