@@ -389,7 +389,7 @@ function SectionTree({ sections, onJump }) {
   );
 }
 
-function ExportPanel({ doc, apiStatus, notify }) {
+function ExportPanel({ doc, apiStatus, notify, compact = false }) {
   const [busy, setBusy] = useState({});
   const [author, setAuthor] = useState("");
   const [showSettings, setShowSettings] = useState(false);
@@ -403,60 +403,69 @@ function ExportPanel({ doc, apiStatus, notify }) {
     fd.append("text",   doc.text);
     fd.append("title",  doc.title);
     fd.append("author", author);
-
     try {
       if (format === "txt") {
-        // TXT can always be done client-side
         const header = `${"=".repeat(70)}\n  ${doc.title}\n  Generated: ${new Date().toLocaleString()}\n${"=".repeat(70)}\n\n`;
         const blob = new Blob([header + doc.text], { type:"text/plain" });
-        const a = document.createElement("a");
-        a.href = URL.createObjectURL(blob);
-        a.download = `${safeName(doc.title)}.txt`;
-        a.click();
+        const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
+        a.download = `${safeName(doc.title)}.txt`; a.click();
         setTimeout(() => URL.revokeObjectURL(a.href), 2000);
         notify("TXT downloaded!", "ok");
       } else if (apiStatus === "ok") {
         await downloadBlob(`${API}/api/export/${format}`, fd, `${safeName(doc.title)}.${format}`);
         notify(`${format.toUpperCase()} downloaded!`, "ok");
       } else if (format === "pdf") {
-        // Client-side PDF fallback using jsPDF (loaded dynamically)
-        await clientPDF(doc);
-        notify("PDF downloaded (browser mode)!", "ok");
+        await clientPDF(doc); notify("PDF downloaded (browser mode)!", "ok");
       } else {
         notify("Backend required for DOCX. Check API connection.", "warn");
       }
-    } catch (e) {
-      notify(`Export failed: ${e.message}`, "error");
-    } finally {
-      mark(format, false);
-    }
+    } catch (e) { notify(`Export failed: ${e.message}`, "error"); }
+    finally { mark(format, false); }
   };
 
   const doSearchablePDF = async () => {
-    if (!doc?.rawFile || apiStatus !== "ok") {
-      notify("Searchable PDF requires backend + original file upload", "warn");
-      return;
-    }
+    if (!doc) { notify("No document selected", "warn"); return; }
+    if (apiStatus !== "ok") { notify("Backend required for Searchable PDF", "warn"); return; }
+    const src = doc.thumb || doc.imageSrc;
+    if (!src) { notify("No image — upload an image file first", "warn"); return; }
     mark("searchable", true);
-    const fd = new FormData();
-    fd.append("file", doc.rawFile);
     try {
+      const res  = await fetch(src);
+      const blob = await res.blob();
+      const file = new File([blob], `${safeName(doc.title)}.jpg`, { type:"image/jpeg" });
+      const fd   = new FormData();
+      fd.append("file", file);
+      fd.append("language", "eng");
       await downloadBlob(`${API}/api/ocrmypdf`, fd, `${safeName(doc.title)}_searchable.pdf`);
       notify("Searchable PDF downloaded!", "ok");
-    } catch (e) {
-      notify(`OCRmyPDF failed: ${e.message}`, "error");
-    } finally {
-      mark("searchable", false);
-    }
+    } catch (e) { notify(`OCRmyPDF failed: ${e.message}`, "error"); }
+    finally { mark("searchable", false); }
   };
 
   const formats = [
-    { key:"pdf",        icon:<FileText size={14}/>,    label:"Structured PDF",     desc:"Sections, TOC, chapters" },
-    { key:"docx",       icon:<FileOutput size={14}/>,  label:"Word DOCX",          desc:"Headings, styles, TOC" },
-    { key:"txt",        icon:<FileText size={14}/>,    label:"Plain Text",         desc:"Raw OCR output" },
-    { key:"searchable", icon:<Search size={14}/>,      label:"Searchable PDF",     desc:"OCRmyPDF (backend)" },
+    { key:"pdf",        icon:"📄", label:"Structured PDF",  desc:"Sections, TOC, chapters",  action: () => doExport("pdf") },
+    { key:"docx",       icon:"📝", label:"Word DOCX",       desc:"Headings, styles, TOC",     action: () => doExport("docx") },
+    { key:"txt",        icon:"📋", label:"Plain Text",      desc:"Raw OCR output",            action: () => doExport("txt") },
+    { key:"searchable", icon:"🔍", label:"Searchable PDF",  desc:"OCRmyPDF — with text layer", action: doSearchablePDF },
   ];
 
+  // ── Compact horizontal bar ────────────────────────────────────────────────
+  if (compact) return (
+    <div style={{ display:"flex", alignItems:"center", gap:6, flexWrap:"wrap" }}>
+      <span style={{ fontSize:11, fontWeight:600, color:"var(--gray)", whiteSpace:"nowrap" }}>
+        Download as:
+      </span>
+      {formats.map(f => (
+        <button key={f.key} disabled={!doc || busy[f.key]} onClick={f.action}
+          style={{ ...S.btn(f.key==="pdf"?"primary":"default","sm"), opacity:!doc?0.4:1, gap:4 }}>
+          {busy[f.key] ? <Spinner size={11}/> : <span>{f.icon}</span>}
+          {f.label}
+        </button>
+      ))}
+    </div>
+  );
+
+  // ── Full sidebar panel ────────────────────────────────────────────────────
   return (
     <div style={{ ...S.card, display:"flex", flexDirection:"column", gap:10 }}>
       <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
@@ -465,31 +474,24 @@ function ExportPanel({ doc, apiStatus, notify }) {
           <Settings size={12} /> Options
         </button>
       </div>
-
       {showSettings && (
         <div style={{ padding:"10px", background:"var(--light)", borderRadius:"var(--radius-sm)" }}>
           <label style={{ fontSize:11, color:"var(--gray)", display:"block", marginBottom:4 }}>Author name (optional)</label>
-          <input value={author} onChange={e=>setAuthor(e.target.value)}
-            placeholder="e.g. Audit Team"
+          <input value={author} onChange={e=>setAuthor(e.target.value)} placeholder="e.g. Audit Team"
             style={{ width:"100%", padding:"6px 10px", fontSize:12, borderRadius:"var(--radius-sm)",
                      border:"1px solid var(--border-d)", background:"var(--white)", color:"var(--dark)" }} />
         </div>
       )}
-
       <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
         {formats.map(f => (
-          <button key={f.key} onClick={() => f.key==="searchable" ? doSearchablePDF() : doExport(f.key)}
-            disabled={!doc || busy[f.key]}
-            style={{
-              ...S.btn(f.key==="pdf" ? "primary" : "default", "sm"),
-              width:"100%", justifyContent:"space-between",
-              opacity: !doc ? 0.5 : 1,
-            }}>
+          <button key={f.key} onClick={f.action} disabled={!doc || busy[f.key]}
+            style={{ ...S.btn(f.key==="pdf"?"primary":"default","sm"),
+                     width:"100%", justifyContent:"space-between", opacity:!doc?0.5:1 }}>
             <span style={{ display:"flex", alignItems:"center", gap:6 }}>
-              {busy[f.key] ? <Spinner size={13}/> : f.icon}
+              {busy[f.key] ? <Spinner size={13}/> : <span>{f.icon}</span>}
               {f.label}
             </span>
-            <span style={{ fontSize:10, color: f.key==="pdf" ? "rgba(255,255,255,0.7)" : "var(--gray)" }}>
+            <span style={{ fontSize:10, color:f.key==="pdf"?"rgba(255,255,255,0.7)":"var(--gray)" }}>
               {f.desc}
             </span>
           </button>
@@ -604,7 +606,26 @@ function FileItem({ item, active, onClick, onDelete }) {
   );
 }
 
-// ─── Scan to PDF (client-side, like Adobe Scan) ──────────────────────────────
+// ─── Compress image before upload ────────────────────────────────────────────
+async function compressImage(file, maxWidthPx = 1800, qualityJpeg = 0.82) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const scale  = Math.min(1, maxWidthPx / Math.max(img.width, img.height));
+      const canvas = document.createElement("canvas");
+      canvas.width  = Math.round(img.width  * scale);
+      canvas.height = Math.round(img.height * scale);
+      canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob(blob => {
+        if (!blob || blob.size >= file.size) { resolve(file); return; }
+        resolve(new File([blob], file.name.replace(/\.[^.]+$/, ".jpg"),
+                         { type:"image/jpeg" }));
+      }, "image/jpeg", qualityJpeg);
+    };
+    img.onerror = () => resolve(file);
+    img.src = URL.createObjectURL(file);
+  });
+}
 async function scanPagesToPDF(pages) {
   // Load jsPDF dynamically
   if (!window.jspdf) {
@@ -814,17 +835,22 @@ export default function App() {
     const ext   = file.name.split(".").pop().toLowerCase();
     const isImg = file.type.startsWith("image/");
 
-    // Auto-crop image before processing
+    // Compress + auto-crop image before processing
     let thumb = null;
     let croppedFile = file;
     if (isImg) {
-      if (!silent) patchDoc(id, { progressLabel:"Auto-cropping…", progress:5 });
-      const rawDataURL = await toDataURL(file);
+      if (!silent) patchDoc(id, { progressLabel:"Optimising image…", progress:3 });
+      // Step 1: compress (reduces upload time 70-80%)
+      const compressed = await compressImage(file);
+      // Step 2: auto-crop
+      const rawDataURL = await toDataURL(compressed);
       const croppedDataURL = await autoCropImage(rawDataURL);
       thumb = croppedDataURL;
       const res = await fetch(croppedDataURL);
       const blob = await res.blob();
-      croppedFile = new File([blob], file.name, { type:"image/jpeg" });
+      croppedFile = new File([blob], file.name.replace(/\.[^.]+$/, ".jpg"),
+                             { type:"image/jpeg" });
+      if (!silent) patchDoc(id, { progressLabel:"Uploading…", progress:8 });
     }
 
     if (!existingDocId) {
@@ -1181,6 +1207,15 @@ export default function App() {
 
         {/* Text content */}
         <div style={{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden" }}>
+
+          {/* Download bar — top of output */}
+          {activeDOC.status === "done" && (
+            <div style={{ padding:"8px 16px", borderBottom:"1px solid var(--border)",
+                          background:"var(--white)" }}>
+              <ExportPanel doc={activeDOC} apiStatus={apiStatus} notify={notify} compact={true} />
+            </div>
+          )}
+
           {/* Stats bar */}
           <div style={{ display:"flex", alignItems:"center", gap:12, padding:"8px 16px",
                         borderBottom:"1px solid var(--border)", background:"var(--light)",
@@ -1894,7 +1929,17 @@ export default function App() {
                   onClick={()=>{setActiveId(d.id);setMobileTab("result");}}
                   onDelete={id=>setDocs(ds=>ds.filter(x=>x.id!==id))} />)
           )}
-          {mobileTab==="result"  && <div style={{ display:"flex", flexDirection:"column", flex:1 }}><ResultView /></div>}
+          {mobileTab==="result"  && (
+            <div style={{ display:"flex", flexDirection:"column", flex:1 }}>
+              {activeDOC?.status === "done" && (
+                <div style={{ padding:"10px 0 6px",
+                              borderBottom:"1px solid var(--border)" }}>
+                  <ExportPanel doc={activeDOC} apiStatus={apiStatus} notify={notify} compact={true} />
+                </div>
+              )}
+              <ResultView />
+            </div>
+          )}
           {mobileTab==="export"  && <ExportPanel doc={activeDOC} apiStatus={apiStatus} notify={notify} />}
         </div>
 

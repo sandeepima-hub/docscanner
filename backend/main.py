@@ -534,10 +534,36 @@ async def make_searchable(background_tasks: BackgroundTasks,
                           file: UploadFile=File(...), language: str=Form("eng")):
     if not OCRMYPDF_AVAILABLE: raise HTTPException(500, "ocrmypdf not installed")
     data = await file.read()
-    ext  = Path(file.filename or "").suffix.lower() or ".pdf"
-    inp  = tmp(ext); out = tmp("_searchable.pdf")
+    ext  = Path(file.filename or "").suffix.lower() or ".jpg"
+
+    inp = tmp(ext)
     inp.write_bytes(data)
-    ocrmypdf.ocr(str(inp), str(out), language=language, skip_text=True, deskew=True, clean=True)
-    background_tasks.add_task(rm, str(inp)); background_tasks.add_task(rm, str(out))
-    return FileResponse(str(out), media_type="application/pdf",
-                        filename=f"{safe_name(Path(file.filename or 'doc').stem)}_searchable.pdf")
+    out = tmp("_searchable.pdf")
+
+    try:
+        # If input is an image, convert to PDF first via pdf2image / PIL
+        if ext in IMAGE_EXTS or (file.content_type or "").startswith("image/"):
+            if not PDF2IMAGE_AVAILABLE:
+                raise HTTPException(400, "pdf2image not available for image input")
+            from PIL import Image as PILImage
+            img = PILImage.open(str(inp))
+            if img.mode not in ("RGB", "L"): img = img.convert("RGB")
+            img_pdf = tmp(".pdf")
+            img.save(str(img_pdf), "PDF", resolution=200)
+            ocrmypdf.ocr(str(img_pdf), str(out), language=language,
+                         skip_text=False, deskew=True, clean=True,
+                         optimize=1, output_type="pdf")
+            background_tasks.add_task(rm, str(img_pdf))
+        else:
+            ocrmypdf.ocr(str(inp), str(out), language=language,
+                         skip_text=True, deskew=True, clean=True,
+                         optimize=1, output_type="pdf")
+
+        background_tasks.add_task(rm, str(inp))
+        background_tasks.add_task(rm, str(out))
+        fname = Path(file.filename or "document").stem
+        return FileResponse(str(out), media_type="application/pdf",
+                            filename=f"{safe_name(fname)}_searchable.pdf")
+    except Exception as e:
+        background_tasks.add_task(rm, str(inp))
+        raise HTTPException(500, f"OCRmyPDF failed: {str(e)[:200]}")
