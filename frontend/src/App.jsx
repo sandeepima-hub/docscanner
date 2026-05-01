@@ -10,54 +10,99 @@ import { createWorker } from "tesseract.js";
 // ─── Config ────────────────────────────────────────────────────────────────
 const API = import.meta.env.VITE_API_URL || "";
 
-// ─── Auto-crop: detect document edges using canvas ──────────────────────────
+// ─── Auto-crop: smarter edge detection for real document photos ──────────────
 async function autoCropImage(dataURL) {
   return new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
       const canvas = document.createElement("canvas");
-      canvas.width = img.width;
+      canvas.width  = img.width;
       canvas.height = img.height;
       const ctx = canvas.getContext("2d");
       ctx.drawImage(img, 0, 0);
 
-      const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-      let minX = canvas.width, minY = canvas.height, maxX = 0, maxY = 0;
-      const threshold = 240; // white background threshold
+      const W = canvas.width;
+      const H = canvas.height;
+      const data = ctx.getImageData(0, 0, W, H).data;
 
-      for (let y = 0; y < canvas.height; y++) {
-        for (let x = 0; x < canvas.width; x++) {
-          const idx = (y * canvas.width + x) * 4;
-          const r = data[idx], g = data[idx+1], b = data[idx+2];
-          // If pixel is not near-white, it's content
-          if (r < threshold || g < threshold || b < threshold) {
-            if (x < minX) minX = x;
-            if (x > maxX) maxX = x;
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
-          }
+      // Helper: get luminance of pixel at (x,y)
+      const lum = (x, y) => {
+        const i = (y * W + x) * 4;
+        return 0.299*data[i] + 0.587*data[i+1] + 0.114*data[i+2];
+      };
+
+      // Sample edges to find where content starts
+      // We scan from each edge inward until we see a significant contrast change
+      const SAMPLE_STEP = 4;
+      const CONTRAST_THRESHOLD = 18;
+      const EDGE_SAMPLE = 20; // sample points along each edge
+
+      let top    = 0;
+      let bottom = H - 1;
+      let left   = 0;
+      let right  = W - 1;
+
+      // Find top edge
+      outer: for (let y = 0; y < H * 0.4; y += SAMPLE_STEP) {
+        let varSum = 0;
+        for (let i = 0; i < EDGE_SAMPLE; i++) {
+          const x = Math.floor((W / EDGE_SAMPLE) * i);
+          if (y + SAMPLE_STEP < H) varSum += Math.abs(lum(x, y) - lum(x, y + SAMPLE_STEP));
         }
+        if (varSum / EDGE_SAMPLE > CONTRAST_THRESHOLD) { top = Math.max(0, y - SAMPLE_STEP); break outer; }
       }
 
-      // Add padding
-      const pad = 20;
-      minX = Math.max(0, minX - pad);
-      minY = Math.max(0, minY - pad);
-      maxX = Math.min(canvas.width, maxX + pad);
-      maxY = Math.min(canvas.height, maxY + pad);
+      // Find bottom edge
+      outer2: for (let y = H - 1; y > H * 0.6; y -= SAMPLE_STEP) {
+        let varSum = 0;
+        for (let i = 0; i < EDGE_SAMPLE; i++) {
+          const x = Math.floor((W / EDGE_SAMPLE) * i);
+          if (y - SAMPLE_STEP >= 0) varSum += Math.abs(lum(x, y) - lum(x, y - SAMPLE_STEP));
+        }
+        if (varSum / EDGE_SAMPLE > CONTRAST_THRESHOLD) { bottom = Math.min(H - 1, y + SAMPLE_STEP); break outer2; }
+      }
 
-      const cropW = maxX - minX;
-      const cropH = maxY - minY;
+      // Find left edge
+      outer3: for (let x = 0; x < W * 0.4; x += SAMPLE_STEP) {
+        let varSum = 0;
+        for (let i = 0; i < EDGE_SAMPLE; i++) {
+          const y = Math.floor((H / EDGE_SAMPLE) * i);
+          if (x + SAMPLE_STEP < W) varSum += Math.abs(lum(x, y) - lum(x + SAMPLE_STEP, y));
+        }
+        if (varSum / EDGE_SAMPLE > CONTRAST_THRESHOLD) { left = Math.max(0, x - SAMPLE_STEP); break outer3; }
+      }
 
-      // If crop is too small or failed, return original
-      if (cropW < 100 || cropH < 100) { resolve(dataURL); return; }
+      // Find right edge
+      outer4: for (let x = W - 1; x > W * 0.6; x -= SAMPLE_STEP) {
+        let varSum = 0;
+        for (let i = 0; i < EDGE_SAMPLE; i++) {
+          const y = Math.floor((H / EDGE_SAMPLE) * i);
+          if (x - SAMPLE_STEP >= 0) varSum += Math.abs(lum(x, y) - lum(x - SAMPLE_STEP, y));
+        }
+        if (varSum / EDGE_SAMPLE > CONTRAST_THRESHOLD) { right = Math.min(W - 1, x + SAMPLE_STEP); break outer4; }
+      }
 
-      const cropCanvas = document.createElement("canvas");
-      cropCanvas.width = cropW;
-      cropCanvas.height = cropH;
-      const cropCtx = cropCanvas.getContext("2d");
-      cropCtx.drawImage(canvas, minX, minY, cropW, cropH, 0, 0, cropW, cropH);
-      resolve(cropCanvas.toDataURL("image/jpeg", 0.92));
+      const cropW = right - left;
+      const cropH = bottom - top;
+
+      // Only crop if result is meaningful (>50% of original)
+      if (cropW < W * 0.4 || cropH < H * 0.4) {
+        resolve(dataURL); // crop failed — return original
+        return;
+      }
+
+      // Add small padding
+      const pad = 12;
+      const fx = Math.max(0, left - pad);
+      const fy = Math.max(0, top  - pad);
+      const fw = Math.min(W, cropW + pad * 2);
+      const fh = Math.min(H, cropH + pad * 2);
+
+      const out = document.createElement("canvas");
+      out.width  = fw;
+      out.height = fh;
+      out.getContext("2d").drawImage(canvas, fx, fy, fw, fh, 0, 0, fw, fh);
+      resolve(out.toDataURL("image/jpeg", 0.92));
     };
     img.onerror = () => resolve(dataURL);
     img.src = dataURL;
@@ -1328,15 +1373,28 @@ export default function App() {
   const acceptPage = () => {
     if (lastCapture) setScanPages(p => [...p, lastCapture]);
     setLastCapture(null);
-    setCamMode("live");
-    startEdgeDetection();
+    if (isMobileBrowser) {
+      setCamMode("idle"); // On mobile, go back to idle so user can tap scan again
+    } else {
+      setCamMode("live");
+      startEdgeDetection();
+    }
   };
 
   // Retake
   const retakePage = () => {
     setLastCapture(null);
-    setCamMode("live");
-    startEdgeDetection();
+    if (isMobileBrowser) {
+      setCamMode("idle");
+      // Re-open camera automatically
+      setTimeout(() => {
+        scanInputRef.current?.setAttribute("capture", "environment");
+        scanInputRef.current?.click();
+      }, 100);
+    } else {
+      setCamMode("live");
+      startEdgeDetection();
+    }
   };
 
   // Cleanup on unmount
@@ -1481,33 +1539,64 @@ export default function App() {
 
         {/* ── REVIEW PAGE ───────────────────────────────────────────────── */}
         {camMode === "review" && lastCapture && (
-          <div style={{ flex:1, display:"flex", flexDirection:"column" }}>
-            <img src={lastCapture} style={{ flex:1, objectFit:"contain", display:"block" }} />
-            <div style={{ padding:"16px", background:"#111",
-                           display:"flex", alignItems:"center", justifyContent:"space-around" }}>
-              <button onClick={retakePage}
-                style={{ background:"#333", border:"none", borderRadius:12, padding:"12px 24px",
-                          cursor:"pointer", color:"#fff", fontWeight:600, fontSize:13,
-                          display:"flex", alignItems:"center", gap:8 }}>
-                <RotateCcw size={15}/> Retake
-              </button>
-              <div style={{ textAlign:"center" }}>
-                <div style={{ color:"#aaa", fontSize:11 }}>Page {scanPages.length+1}</div>
-                <div style={{ color:"#fff", fontSize:10, marginTop:2 }}>Auto-cropped ✓</div>
+          <div style={{ flex:1, display:"flex", flexDirection:"column", background:"#111",
+                        height:"100%", overflow:"hidden" }}>
+            {/* Fixed height image — never pushes buttons off screen */}
+            <div style={{ flex:1, minHeight:0, display:"flex", alignItems:"center",
+                           justifyContent:"center", overflow:"hidden", padding:"12px" }}>
+              <img src={lastCapture} style={{
+                maxWidth:"100%", maxHeight:"100%",
+                objectFit:"contain", display:"block",
+                borderRadius:8, border:"2px solid #0F6E56",
+              }} />
+            </div>
+
+            {/* Page info */}
+            <div style={{ textAlign:"center", padding:"8px 0 4px" }}>
+              <div style={{ color:"#0F6E56", fontSize:12, fontWeight:700 }}>
+                Page {scanPages.length + 1} — Auto-cropped ✓
               </div>
-              <button onClick={acceptPage}
-                style={{ background:"#0F6E56", border:"none", borderRadius:12, padding:"12px 24px",
-                          cursor:"pointer", color:"#fff", fontWeight:600, fontSize:13,
-                          display:"flex", alignItems:"center", gap:8 }}>
-                <CheckCircle size={15}/> Keep
+            </div>
+
+            {/* Action buttons — always visible at bottom */}
+            <div style={{ padding:"8px 16px", display:"flex", gap:10, flexShrink:0 }}>
+              <button onClick={retakePage} style={{
+                flex:1, background:"#333", border:"1px solid #555",
+                borderRadius:12, padding:"14px 0", cursor:"pointer",
+                color:"#fff", fontWeight:600, fontSize:14,
+                display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}>
+                <RotateCcw size={16}/> Retake
+              </button>
+              <button onClick={acceptPage} style={{
+                flex:1, background:"#0F6E56", border:"none",
+                borderRadius:12, padding:"14px 0", cursor:"pointer",
+                color:"#fff", fontWeight:700, fontSize:14,
+                display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}>
+                <CheckCircle size={16}/> Keep
               </button>
             </div>
-            <div style={{ display:"flex", gap:8, padding:"0 16px 16px", background:"#111" }}>
-              <button onClick={() => { acceptPage(); }} style={{
-                flex:1, background:"#1a1a1a", border:"1px solid #333", borderRadius:10,
-                padding:"10px", cursor:"pointer", color:"#aaa", fontSize:12,
+
+            {/* Scan next / Save buttons */}
+            <div style={{ padding:"0 16px 20px", display:"flex", gap:10, flexShrink:0 }}>
+              <button onClick={() => {
+                acceptPage();
+                setTimeout(() => {
+                  scanInputRef.current?.setAttribute("capture","environment");
+                  scanInputRef.current?.click();
+                }, 150);
+              }} style={{
+                flex:1, background:"#1a1a1a", border:"1px solid #333",
+                borderRadius:10, padding:"10px 0", cursor:"pointer",
+                color:"#aaa", fontSize:12, fontWeight:500,
                 display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}>
-                <Plus size={13}/> Accept &amp; scan next
+                <Plus size={13}/> Keep &amp; Scan Next
+              </button>
+              <button onClick={() => { acceptPage(); }} style={{
+                flex:1, background:"#1a1a1a", border:"1px solid #333",
+                borderRadius:10, padding:"10px 0", cursor:"pointer",
+                color:"#aaa", fontSize:12, fontWeight:500,
+                display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}>
+                <Download size={13}/> Keep &amp; Save
               </button>
             </div>
           </div>
