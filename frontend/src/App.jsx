@@ -122,16 +122,28 @@ const toDataURL = (file) => new Promise((res, rej) => {
   r.readAsDataURL(file);
 });
 
-// Download blob received from backend fetch
+// Download blob received from backend fetch — 90s timeout for heavy exports
 async function downloadBlob(url, formData, filename) {
-  const res = await fetch(url, { method: "POST", body: formData });
-  if (!res.ok) throw new Error(`Export failed: ${res.status}`);
-  const blob = await res.blob();
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = filename;
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 90000); // 90s
+  try {
+    const res = await fetch(url, { method:"POST", body:formData, signal:controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) {
+      const errText = await res.text().catch(() => res.status);
+      throw new Error(`Server error ${res.status}: ${errText.slice(0,120)}`);
+    }
+    const blob = await res.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  } catch(e) {
+    clearTimeout(timer);
+    if (e.name === "AbortError") throw new Error("Request timed out — server may be waking up, try again in 30s");
+    throw e;
+  }
 }
 
 // ─── Section tree — client-side heuristic (mirrors backend) ─────────────────
@@ -426,20 +438,23 @@ function ExportPanel({ doc, apiStatus, notify, compact = false }) {
   const doSearchablePDF = async () => {
     if (!doc) { notify("No document selected", "warn"); return; }
     if (apiStatus !== "ok") { notify("Backend required for Searchable PDF", "warn"); return; }
-    const src = doc.thumb || doc.imageSrc;
-    if (!src) { notify("No image — upload an image file first", "warn"); return; }
+    if (!doc.text?.trim()) { notify("No OCR text available — run OCR first", "warn"); return; }
     mark("searchable", true);
     try {
-      const res  = await fetch(src);
-      const blob = await res.blob();
-      const file = new File([blob], `${safeName(doc.title)}.jpg`, { type:"image/jpeg" });
-      const fd   = new FormData();
-      fd.append("file", file);
-      fd.append("language", "eng");
-      await downloadBlob(`${API}/api/ocrmypdf`, fd, `${safeName(doc.title)}_searchable.pdf`);
+      // Generate searchable PDF from OCR text via reportlab (no image needed)
+      // This creates a proper PDF with invisible text layer — fully searchable/copyable
+      const fd = new FormData();
+      fd.append("text",   doc.text);
+      fd.append("title",  doc.title || "Document");
+      fd.append("author", "DocScanPro");
+      await downloadBlob(`${API}/api/export/pdf`, fd,
+                         `${safeName(doc.title)}_searchable.pdf`);
       notify("Searchable PDF downloaded!", "ok");
-    } catch (e) { notify(`OCRmyPDF failed: ${e.message}`, "error"); }
-    finally { mark("searchable", false); }
+    } catch (e) {
+      notify(`Searchable PDF failed: ${e.message}`, "error");
+    } finally {
+      mark("searchable", false);
+    }
   };
 
   const formats = [
@@ -668,14 +683,20 @@ const STORAGE_KEY = "docscanner_library_v1";
 
 function saveLibrary(docs) {
   try {
-    // Don't save rawFile (not serializable), save thumb + text only
     const serializable = docs.map(d => ({
       ...d,
       rawFile: null,
-      // Limit thumb size for storage
-      thumb: d.thumb ? d.thumb.substring(0, 50000) : null,
+      // Keep full thumb — truncating breaks the dataURL
+      // If storage is full, skip thumb rather than corrupt it
     }));
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(serializable));
+    // Try with full thumbs first
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(serializable));
+    } catch(e) {
+      // Storage full — save without thumbs
+      const noThumbs = serializable.map(d => ({ ...d, thumb:null }));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(noThumbs));
+    }
   } catch (e) {
     console.warn("Could not save to localStorage:", e);
   }
