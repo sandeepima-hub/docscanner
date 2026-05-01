@@ -14,6 +14,8 @@ import io, os, re, uuid, tempfile, datetime, base64, httpx
 try:
     import pytesseract
     from PIL import Image
+    # Free memory after import
+    import gc
     OCR_AVAILABLE = True
 except ImportError:
     OCR_AVAILABLE = False
@@ -456,9 +458,12 @@ async def ocr(
     if ext == ".pdf":
         if not PDF2IMAGE_AVAILABLE:
             raise HTTPException(400, "pdf2image not available")
-        for img in convert_from_bytes(data, dpi=200, fmt="jpeg"):
-            buf = io.BytesIO(); img.save(buf, "JPEG", quality=92)
+        # Lower DPI to reduce memory usage on free tier
+        for img in convert_from_bytes(data, dpi=150, fmt="jpeg"):
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=85)
             images_bytes.append(buf.getvalue())
+            del img  # free memory immediately
     elif ext in IMAGE_EXTS or (file.content_type or "").startswith("image/"):
         images_bytes = [data]
     else:
@@ -474,6 +479,7 @@ async def ocr(
                     img = Image.open(io.BytesIO(img_bytes))
                     if img.mode not in ("RGB","L"): img = img.convert("RGB")
                     text = pytesseract.image_to_string(img, lang=language)
+                    del img
                 else:
                     text = "[OCR unavailable]"
         else:
@@ -482,6 +488,8 @@ async def ocr(
             img = Image.open(io.BytesIO(img_bytes))
             if img.mode not in ("RGB","L","RGBA"): img = img.convert("RGB")
             text = pytesseract.image_to_string(img, lang=language)
+            del img  # free memory
+        import gc; gc.collect()  # force garbage collection
         page_texts.append({"page": i+1, "text": text.strip()})
 
     full_text = "\n\n--- Page Break ---\n\n".join(p["text"] for p in page_texts)
@@ -549,15 +557,19 @@ async def make_searchable(background_tasks: BackgroundTasks,
             img = PILImage.open(str(inp))
             if img.mode not in ("RGB", "L"): img = img.convert("RGB")
             img_pdf = tmp(".pdf")
-            img.save(str(img_pdf), "PDF", resolution=200)
+            img.save(str(img_pdf), "PDF", resolution=150)
+            del img
+            import gc; gc.collect()
             ocrmypdf.ocr(str(img_pdf), str(out), language=language,
-                         skip_text=False, deskew=True, clean=True,
-                         optimize=1, output_type="pdf")
+                         skip_text=False, deskew=False, clean=False,
+                         optimize=0, output_type="pdf",
+                         jobs=1)
             background_tasks.add_task(rm, str(img_pdf))
         else:
             ocrmypdf.ocr(str(inp), str(out), language=language,
-                         skip_text=True, deskew=True, clean=True,
-                         optimize=1, output_type="pdf")
+                         skip_text=True, deskew=False, clean=False,
+                         optimize=0, output_type="pdf",
+                         jobs=1)
 
         background_tasks.add_task(rm, str(inp))
         background_tasks.add_task(rm, str(out))
