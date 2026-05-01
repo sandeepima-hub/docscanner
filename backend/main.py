@@ -427,6 +427,7 @@ def build_docx(sections: list[dict], title: str, author: str, out: str):
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
+@app.head("/api/health")
 def health():
     return {
         "status": "ok",
