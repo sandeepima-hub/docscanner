@@ -1191,8 +1191,26 @@ export default function App() {
   const [flashOn,      setFlashOn]      = useState(false);
   const [torchTrack,   setTorchTrack]   = useState(null);
 
+  // Detect mobile browser
+  const isMobileBrowser = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+
   // Start live camera
   const startCamera = async () => {
+    // On mobile browsers, getUserMedia video viewfinder is unreliable
+    // Use native camera input instead for guaranteed compatibility
+    if (isMobileBrowser) {
+      scanInputRef.current?.setAttribute("capture", "environment");
+      scanInputRef.current?.click();
+      return;
+    }
+
+    // Desktop — use live viewfinder
+    if (!navigator.mediaDevices?.getUserMedia) {
+      notify("Camera API not available — using file picker instead", "warn");
+      scanInputRef.current?.click();
+      return;
+    }
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode:"environment", width:{ideal:1920}, height:{ideal:1080} },
@@ -1203,14 +1221,14 @@ export default function App() {
         videoRef.current.srcObject = stream;
         await videoRef.current.play();
       }
-      // Store torch track if available
       const track = stream.getVideoTracks()[0];
       if (track?.getCapabilities?.()?.torch) setTorchTrack(track);
       setCamMode("live");
       startEdgeDetection();
     } catch (e) {
-      notify("Camera access denied — using file upload instead", "warn");
-      setCamMode("idle");
+      notify("Camera access denied — using file picker instead", "warn");
+      scanInputRef.current?.setAttribute("capture", "environment");
+      scanInputRef.current?.click();
     }
   };
 
@@ -1550,7 +1568,9 @@ export default function App() {
         {/* Start camera */}
         <button onClick={startCamera}
           style={{ ...S.btn("primary","lg"), width:"100%", justifyContent:"center", marginBottom:10 }}>
-          <Camera size={18}/> {scanPages.length > 0 ? "Scan More Pages" : "Open Live Scanner"}
+          <Camera size={18}/> {isMobileBrowser
+            ? (scanPages.length > 0 ? "Scan More Pages" : "Open Camera")
+            : (scanPages.length > 0 ? "Scan More Pages" : "Open Live Scanner")}
         </button>
 
         {/* Fallback file input */}
@@ -1565,8 +1585,10 @@ export default function App() {
                        borderRadius:"var(--radius-md)", border:"1px solid var(--teal-l)" }}>
           <div style={{ fontSize:11, color:"var(--teal)", fontWeight:600 }}>💡 How it works</div>
           <div style={{ fontSize:11, color:"var(--gray)", marginTop:3, lineHeight:1.5 }}>
-            Green brackets appear when a document is detected. Tap the shutter. Review → Keep or Retake.
-            Scan as many pages as needed. Native PDF downloads instantly — OCR runs in the cloud.
+            {isMobileBrowser
+              ? "Tap Open Camera — your phone camera opens natively. Each photo is auto-cropped. Scan as many pages as needed, then save as PDF or run OCR."
+              : "Green brackets appear when a document is detected. Tap the shutter. Review → Keep or Retake. Scan as many pages as needed. Native PDF downloads instantly — OCR runs in the cloud."
+            }
           </div>
         </div>
       </div>
