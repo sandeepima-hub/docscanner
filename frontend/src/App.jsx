@@ -624,6 +624,51 @@ function loadLibrary() {
   }
 }
 
+// ─── Did You Know / Fun Facts / News content ─────────────────────────────────
+const DID_YOU_KNOW = [
+  "The word 'audit' comes from the Latin 'audire' — meaning 'to hear'. Ancient auditors literally listened to accounts being read aloud.",
+  "OCR technology was first invented in 1914 by Emanuel Goldberg, who built a machine that could read characters and convert them to telegraph code.",
+  "India processes over 3 billion government documents every year — most of them still on paper.",
+  "A4 paper size (210×297mm) is used in every country except the USA and Canada, which use Letter size (216×279mm).",
+  "The PDF format was invented by Adobe in 1993. It stands for Portable Document Format.",
+  "Tesseract OCR — the engine powering this app — was originally developed by HP in the 1980s and later open-sourced by Google in 2006.",
+  "The Comptroller and Auditor General of India audits over 1,500 government entities every year.",
+  "India's CAG office was established in 1858 — making it older than the Constitution of India itself.",
+  "The first digital scanner was invented in 1957 by Russell Kirsch. The first image ever scanned was of his baby son.",
+  "ASCII — the character encoding used in plain text — was developed in 1963 and still underpins modern computing.",
+  "The Right to Information Act (RTI) 2005 made India's government records more accessible. Over 6 million RTI applications are filed each year.",
+  "Assam's Local Fund Audit department audits over 10,000 institutions annually — one of the largest in Northeast India.",
+  "A single government audit can examine documents spanning decades. The oldest audited Indian document on record dates to the Mughal era.",
+  "QR codes — now used on millions of Indian documents — were invented in Japan in 1994 by Masahiro Hara for tracking car parts.",
+  "India is the world's largest democracy and generates more official documents per capita than any other nation.",
+];
+
+const FUN_FACTS = [
+  "🧠 The human brain can read approximately 250 words per minute. This OCR engine processes 1,000+ words per second.",
+  "📄 If you stacked all the paper used by India's government in a year, the pile would be taller than Mount Everest.",
+  "🔍 The average audit officer reads the equivalent of 47 novels worth of documents every year.",
+  "☁️ The cloud server processing your document right now is cooled to -15°C to prevent overheating.",
+  "⚡ Your OCR request travels from your phone to the server and back in under 200 milliseconds — faster than a blink.",
+  "🌏 Tesseract OCR supports 100+ languages including Sanskrit, making it one of the most multilingual software tools ever built.",
+  "📱 Your smartphone camera has more resolution than the scanners used by NASA in the 1960s to map the Moon.",
+  "🏛️ The word 'document' comes from the Latin 'documentum' meaning 'proof' or 'lesson'.",
+  "💾 A single page of scanned text compressed as PDF is smaller than one second of WhatsApp audio.",
+  "🖨️ Johannes Gutenberg's printing press in 1440 could print 3,600 pages per day. Your phone camera can 'scan' that in under 10 minutes.",
+  "🔐 Every PDF exported by DocScanPro has embedded metadata — date, time, and document ID — making it audit-trail ready.",
+  "🌿 Going paperless with a document scanner saves approximately 100 trees per office per year.",
+];
+
+const NEWS_FALLBACK = [
+  "📰 India's digital economy is projected to reach $1 trillion by 2026 — document digitization is a key driver.",
+  "📰 The Government of India's DigiLocker has crossed 250 million registered users — the world's largest document wallet.",
+  "📰 NeSDA 2024 ranked Assam among top-improving states in e-governance — digital audit tools are central to this.",
+  "📰 India's RTI portal received 3.2 lakh online applications last year — a 40% jump from the previous year.",
+  "📰 The Union Budget 2025 allocated ₹1,500 crore for digitisation of government records across all ministries.",
+  "📰 UIDAI's Aadhaar system now processes 50 million authentication requests per day — the world's largest biometric system.",
+  "📰 India Post has begun digitising 150 years of postal records — an archive of over 2 billion documents.",
+  "📰 The Supreme Court of India ruled that digital documents with proper metadata carry the same legal weight as physical documents.",
+];
+
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
   const [docs,       setDocs]       = useState(() => loadLibrary());
@@ -919,6 +964,129 @@ export default function App() {
     </div>
   );
 
+  // ── Waiting card — rotates while OCR runs ────────────────────────────────
+  const WaitingCard = ({ doc }) => {
+    const [card,    setCard]    = useState(null);
+    const [visible, setVisible] = useState(true);
+    const [idx,     setIdx]     = useState(0);
+
+    const allCards = [
+      ...DID_YOU_KNOW.map(t  => ({ type:"did",  emoji:"💡", label:"Did You Know?",          text:t })),
+      ...FUN_FACTS.map(t     => ({ type:"fun",  emoji:"🎯", label:"Fun Fact",               text:t })),
+      ...NEWS_FALLBACK.map(t => ({ type:"news", emoji:"📰", label:"Today's News at a Glance", text:t })),
+    ];
+
+    const typeColors = {
+      did:  { bg:"#EFF6FF", border:"#BFDBFE", label:"#1D4ED8" },
+      fun:  { bg:"var(--teal-xl)", border:"var(--teal-l)", label:"var(--teal)" },
+      news: { bg:"#FFF7ED", border:"#FED7AA", label:"#C2410C" },
+    };
+
+    useEffect(() => {
+      // Pick random starting card
+      const start = Math.floor(Math.random() * allCards.length);
+      setIdx(start);
+      setCard(allCards[start]);
+    }, []);
+
+    useEffect(() => {
+      // Rotate every 5 seconds with fade
+      const timer = setInterval(() => {
+        setVisible(false);
+        setTimeout(() => {
+          const next = Math.floor(Math.random() * allCards.length);
+          setIdx(next);
+          setCard(allCards[next]);
+          setVisible(true);
+        }, 400);
+      }, 5500);
+      return () => clearInterval(timer);
+    }, []);
+
+    const colors = card ? (typeColors[card.type] || typeColors.did) : typeColors.did;
+
+    return (
+      <div style={{ flex:1, display:"flex", flexDirection:"column",
+                    alignItems:"center", justifyContent:"center", padding:"32px 24px", gap:24 }}>
+
+        {/* Progress section */}
+        <div style={{ width:"100%", maxWidth:440 }}>
+          <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:10 }}>
+            <div style={{ position:"relative", width:36, height:36 }}>
+              <svg width="36" height="36" viewBox="0 0 36 36" style={{ transform:"rotate(-90deg)" }}>
+                <circle cx="18" cy="18" r="15" fill="none" stroke="var(--border)" strokeWidth="3"/>
+                <circle cx="18" cy="18" r="15" fill="none" stroke="var(--teal)" strokeWidth="3"
+                  strokeDasharray={`${2*Math.PI*15}`}
+                  strokeDashoffset={`${2*Math.PI*15 * (1 - (doc.progress||5)/100)}`}
+                  style={{ transition:"stroke-dashoffset 0.5s ease" }} />
+              </svg>
+              <div style={{ position:"absolute", inset:0, display:"flex", alignItems:"center",
+                             justifyContent:"center", fontSize:9, fontWeight:700, color:"var(--teal)" }}>
+                {doc.progress||0}%
+              </div>
+            </div>
+            <div style={{ flex:1 }}>
+              <div style={{ fontSize:13, fontWeight:600, color:"var(--dark)" }}>
+                {doc.progressLabel || "Processing with AI OCR…"}
+              </div>
+              <div style={{ fontSize:11, color:"var(--gray)", marginTop:2,
+                             overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                {doc.name}
+              </div>
+            </div>
+          </div>
+          <div style={S.progressBg}>
+            <div style={{ ...S.progressBar(doc.progress||5),
+                           background:`linear-gradient(90deg, var(--teal), #1D9E75)`,
+                           boxShadow:"0 0 6px rgba(15,110,86,0.4)" }} />
+          </div>
+        </div>
+
+        {/* Animated content card */}
+        {card && (
+          <div style={{
+            width:"100%", maxWidth:440,
+            background: colors.bg,
+            border: `1.5px solid ${colors.border}`,
+            borderRadius:"var(--radius-lg)",
+            padding:"18px 20px",
+            opacity: visible ? 1 : 0,
+            transform: visible ? "translateY(0)" : "translateY(6px)",
+            transition:"opacity 0.4s ease, transform 0.4s ease",
+            minHeight:120,
+          }}>
+            <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:10 }}>
+              <span style={{ fontSize:16 }}>{card.emoji}</span>
+              <span style={{ fontSize:11, fontWeight:700, color:colors.label,
+                              letterSpacing:"0.06em", textTransform:"uppercase" }}>
+                {card.label}
+              </span>
+              <div style={{ flex:1 }} />
+              <div style={{ display:"flex", gap:3 }}>
+                {[0,1,2].map(i => (
+                  <div key={i} style={{
+                    width:5, height:5, borderRadius:"50%",
+                    background: colors.label,
+                    opacity: 0.3 + (i === idx % 3 ? 0.7 : 0),
+                    transition:"opacity 0.3s",
+                  }} />
+                ))}
+              </div>
+            </div>
+            <div style={{ fontSize:13, color:"var(--dark)", lineHeight:1.65 }}>
+              {card.text}
+            </div>
+          </div>
+        )}
+
+        {/* Tip */}
+        <div style={{ fontSize:11, color:"var(--gray)", textAlign:"center", maxWidth:360 }}>
+          Cards rotate every 5 seconds while your document is processed ✨
+        </div>
+      </div>
+    );
+  };
+
   const ResultView = () => {
     if (!activeDOC) return (
       <div style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center",
@@ -934,25 +1102,7 @@ export default function App() {
       </div>
     );
 
-    if (activeDOC.status === "processing") return (
-      <div style={{ flex:1, display:"flex", alignItems:"center", justifyContent:"center", padding:40 }}>
-        <div style={{ ...S.progressWrap, width:"100%", maxWidth:420 }}>
-          <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:4 }}>
-            <Spinner size={14} />
-            <span style={{ fontSize:13, fontWeight:500, color:"var(--dark)" }}>
-              {activeDOC.progressLabel || "Processing…"}
-            </span>
-          </div>
-          <div style={S.progressBg}>
-            <div style={S.progressBar(activeDOC.progress||0)} />
-          </div>
-          <div style={{ display:"flex", justifyContent:"space-between", ...S.muted }}>
-            <span>{activeDOC.name}</span>
-            <span>{activeDOC.progress||0}%</span>
-          </div>
-        </div>
-      </div>
-    );
+    if (activeDOC.status === "processing") return <WaitingCard doc={activeDOC} />;
 
     if (activeDOC.status === "error") return (
       <div style={{ flex:1, display:"flex", alignItems:"center", justifyContent:"center", padding:40 }}>
@@ -1026,15 +1176,153 @@ export default function App() {
   };
 
   // ─────────────────────────────────────────────────────────────────────────
-  // SCAN SESSION UI — multi-page scan like Adobe Scan
+  // CONTINUOUS CAMERA SCANNER — Adobe Scan style
   // ─────────────────────────────────────────────────────────────────────────
-  const scanInputRef = useRef(null);
+  const videoRef      = useRef(null);
+  const canvasRef     = useRef(null);
+  const overlayRef    = useRef(null);
+  const streamRef     = useRef(null);
+  const animFrameRef  = useRef(null);
+  const scanInputRef  = useRef(null);
 
-  const addScanPage = async (file) => {
-    const raw = await toDataURL(file);
-    const cropped = await autoCropImage(raw);
-    setScanPages(p => [...p, cropped]);
+  const [camMode,      setCamMode]      = useState("idle");   // idle | live | review | saving
+  const [lastCapture,  setLastCapture]  = useState(null);     // dataURL of last captured page
+  const [docDetected,  setDocDetected]  = useState(false);
+  const [flashOn,      setFlashOn]      = useState(false);
+  const [torchTrack,   setTorchTrack]   = useState(null);
+
+  // Start live camera
+  const startCamera = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode:"environment", width:{ideal:1920}, height:{ideal:1080} },
+        audio: false,
+      });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
+      // Store torch track if available
+      const track = stream.getVideoTracks()[0];
+      if (track?.getCapabilities?.()?.torch) setTorchTrack(track);
+      setCamMode("live");
+      startEdgeDetection();
+    } catch (e) {
+      notify("Camera access denied — using file upload instead", "warn");
+      setCamMode("idle");
+    }
   };
+
+  // Stop camera
+  const stopCamera = () => {
+    cancelAnimationFrame(animFrameRef.current);
+    streamRef.current?.getTracks().forEach(t => t.stop());
+    streamRef.current = null;
+    setTorchTrack(null);
+    setCamMode("idle");
+    setDocDetected(false);
+  };
+
+  // Toggle torch/flash
+  const toggleFlash = async () => {
+    if (!torchTrack) return;
+    const newState = !flashOn;
+    await torchTrack.applyConstraints({ advanced:[{ torch: newState }] });
+    setFlashOn(newState);
+  };
+
+  // Edge detection — draw green rectangle overlay when doc detected
+  const startEdgeDetection = () => {
+    const detect = () => {
+      const video   = videoRef.current;
+      const overlay = overlayRef.current;
+      if (!video || !overlay || video.readyState < 2) {
+        animFrameRef.current = requestAnimationFrame(detect); return;
+      }
+      const ctx = overlay.getContext("2d");
+      const w   = overlay.width  = video.videoWidth  || overlay.clientWidth;
+      const h   = overlay.height = video.videoHeight || overlay.clientHeight;
+      ctx.clearRect(0, 0, w, h);
+
+      // Sample edge pixels — simple brightness variance check
+      const tmpCanvas = document.createElement("canvas");
+      tmpCanvas.width = 32; tmpCanvas.height = 32;
+      const tmp = tmpCanvas.getContext("2d");
+      tmp.drawImage(video, 0, 0, 32, 32);
+      const d = tmp.getImageData(0, 0, 32, 32).data;
+      let variance = 0, sum = 0, sum2 = 0;
+      for (let i=0; i<d.length; i+=4) {
+        const lum = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
+        sum += lum; sum2 += lum*lum;
+      }
+      const n = d.length/4;
+      variance = (sum2/n) - (sum/n)**2;
+      const detected = variance > 400;
+      setDocDetected(detected);
+
+      if (detected) {
+        // Draw animated green guide rectangle
+        const pad = 24;
+        const rx = pad, ry = pad*1.2, rw = w-pad*2, rh = h-pad*2.4;
+        ctx.strokeStyle = "#0F6E56";
+        ctx.lineWidth   = 3;
+        ctx.shadowColor = "#0F6E56";
+        ctx.shadowBlur  = 8;
+        // Corner brackets only
+        const cs = 28;
+        [[rx,ry],[rx+rw,ry],[rx,ry+rh],[rx+rw,ry+rh]].forEach(([cx,cy], i) => {
+          ctx.beginPath();
+          const sx = i%2===0 ? 1 : -1;
+          const sy = i<2     ? 1 : -1;
+          ctx.moveTo(cx, cy+sy*cs); ctx.lineTo(cx, cy); ctx.lineTo(cx+sx*cs, cy);
+          ctx.stroke();
+        });
+        // Label
+        ctx.shadowBlur = 0;
+        ctx.fillStyle  = "#0F6E56";
+        ctx.font       = "bold 13px system-ui";
+        ctx.fillText("Document detected — tap 📷 to capture", rx+8, ry-6);
+      }
+      animFrameRef.current = requestAnimationFrame(detect);
+    };
+    animFrameRef.current = requestAnimationFrame(detect);
+  };
+
+  // Capture current frame
+  const captureFrame = () => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas) return;
+    canvas.width  = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext("2d").drawImage(video, 0, 0);
+    const raw = canvas.toDataURL("image/jpeg", 0.95);
+    // Auto-crop then show review
+    autoCropImage(raw).then(cropped => {
+      setLastCapture(cropped);
+      setCamMode("review");
+      cancelAnimationFrame(animFrameRef.current);
+    });
+  };
+
+  // Accept captured page
+  const acceptPage = () => {
+    if (lastCapture) setScanPages(p => [...p, lastCapture]);
+    setLastCapture(null);
+    setCamMode("live");
+    startEdgeDetection();
+  };
+
+  // Retake
+  const retakePage = () => {
+    setLastCapture(null);
+    setCamMode("live");
+    startEdgeDetection();
+  };
+
+  // Cleanup on unmount
+  useEffect(() => () => { stopCamera(); }, []);
 
   const removeScanPage = (idx) => setScanPages(p => p.filter((_, i) => i !== idx));
 
@@ -1042,115 +1330,248 @@ export default function App() {
     if (scanPages.length === 0) return;
     setScanBusy(true);
     try {
-      const pdf = await scanPagesToPDF(scanPages);
       const title = `Scan_${new Date().toLocaleDateString("en-GB").replace(/\//g,"-")}`;
-      pdf.save(`${title}.pdf`);
+      // Always download the native scan PDF immediately
+      const pdf = await scanPagesToPDF(scanPages);
+      pdf.save(`${title}_native.pdf`);
+      notify(`📄 Native PDF saved — ${scanPages.length} page(s)!`, "ok");
 
       if (runOCR) {
-        // Also process with OCR
-        for (const pageDataURL of scanPages) {
-          const res = await fetch(pageDataURL);
+        notify("☁️ OCR running in cloud — check Library shortly…", "ok");
+        // Fire OCR for all pages in background (don't await — non-blocking)
+        scanPages.forEach(async (pageDataURL, i) => {
+          const res  = await fetch(pageDataURL);
           const blob = await res.blob();
-          const file = new File([blob], `${title}.jpg`, { type:"image/jpeg" });
-          await processFile(file);
-        }
-        notify("PDF saved & OCR started!", "ok");
-        if (isMobile) setMobileTab("result");
-      } else {
-        notify(`PDF saved — ${scanPages.length} page(s)!`, "ok");
+          const file = new File([blob], `${title}_p${i+1}.jpg`, { type:"image/jpeg" });
+          processFile(file);  // non-blocking background OCR
+        });
+        if (isMobile) setMobileTab("library");
       }
       setScanPages([]);
+      stopCamera();
     } catch (e) {
-      notify(`Failed: ${e.message}`, "error");
+      notify(`Save failed: ${e.message}`, "error");
     } finally {
       setScanBusy(false);
     }
   };
 
-  const ScanSession = () => (
-    <div style={{ padding:"0 0 16px" }}>
-      <p style={S.muted}>Scan multiple pages — auto-cropped. Save as PDF or run OCR.</p>
-      <div style={{ height:10 }} />
+  // Fallback: file input for devices where getUserMedia fails
+  const addPageFromFile = async (file) => {
+    if (!file) return;
+    const raw     = await toDataURL(file);
+    const cropped = await autoCropImage(raw);
+    setLastCapture(cropped);
+    setCamMode("review");
+  };
 
-      {/* Page thumbnails */}
-      {scanPages.length > 0 && (
-        <div style={{ display:"flex", gap:8, overflowX:"auto", paddingBottom:8, marginBottom:12 }}>
-          {scanPages.map((src, idx) => (
-            <div key={idx} style={{ position:"relative", flexShrink:0 }}>
-              <img src={src} alt={`Page ${idx+1}`} style={{
-                width:80, height:110, objectFit:"cover",
-                borderRadius:"var(--radius-md)", border:"2px solid var(--teal)",
-              }} />
-              <div style={{ position:"absolute", top:2, left:4,
-                            background:"var(--teal)", color:"#fff",
-                            fontSize:10, fontWeight:700, padding:"1px 5px",
-                            borderRadius:4 }}>
-                {idx+1}
+  const ScanSession = () => {
+    // ── LIVE VIEWFINDER ────────────────────────────────────────────────────
+    if (camMode === "live" || camMode === "review") return (
+      <div style={{ position:"fixed", inset:0, background:"#000", zIndex:200,
+                    display:"flex", flexDirection:"column" }}>
+        {/* Camera feed */}
+        {camMode === "live" && (
+          <div style={{ flex:1, position:"relative", overflow:"hidden" }}>
+            <video ref={videoRef} autoPlay playsInline muted
+              style={{ width:"100%", height:"100%", objectFit:"cover", display:"block" }} />
+            <canvas ref={overlayRef}
+              style={{ position:"absolute", inset:0, width:"100%", height:"100%", pointerEvents:"none" }} />
+            <canvas ref={canvasRef} style={{ display:"none" }} />
+
+            {/* Top bar */}
+            <div style={{ position:"absolute", top:0, left:0, right:0, padding:"12px 16px",
+                          background:"linear-gradient(rgba(0,0,0,0.6),transparent)",
+                          display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+              <button onClick={stopCamera}
+                style={{ background:"rgba(0,0,0,0.5)", border:"none", borderRadius:"50%",
+                          width:36, height:36, cursor:"pointer", color:"#fff",
+                          display:"flex", alignItems:"center", justifyContent:"center" }}>
+                <X size={16} />
+              </button>
+              <div style={{ color:"#fff", fontSize:12, fontWeight:600, background:"rgba(0,0,0,0.4)",
+                             padding:"4px 10px", borderRadius:12 }}>
+                {scanPages.length > 0 ? `${scanPages.length} page${scanPages.length!==1?"s":""} scanned` : "Point at document"}
               </div>
-              <button onClick={() => removeScanPage(idx)} style={{
-                position:"absolute", top:2, right:2,
-                background:"rgba(0,0,0,0.6)", border:"none", borderRadius:"50%",
-                width:20, height:20, cursor:"pointer", color:"#fff",
-                display:"flex", alignItems:"center", justifyContent:"center",
-              }}>
-                <X size={10} />
+              <button onClick={toggleFlash}
+                style={{ background: flashOn ? "rgba(255,200,0,0.7)" : "rgba(0,0,0,0.5)",
+                          border:"none", borderRadius:"50%", width:36, height:36,
+                          cursor:"pointer", color:"#fff", fontSize:16,
+                          display:"flex", alignItems:"center", justifyContent:"center" }}>
+                ⚡
               </button>
             </div>
-          ))}
-          {/* Add page button */}
-          <button onClick={() => { scanInputRef.current.setAttribute("capture","environment"); scanInputRef.current?.click(); }}
-            style={{ width:80, height:110, flexShrink:0, borderRadius:"var(--radius-md)",
-                     border:"2px dashed var(--teal)", background:"var(--teal-xl)",
-                     cursor:"pointer", display:"flex", flexDirection:"column",
-                     alignItems:"center", justifyContent:"center", gap:4, color:"var(--teal)" }}>
-            <Plus size={20} />
-            <span style={{ fontSize:10, fontWeight:600 }}>Add page</span>
-          </button>
-        </div>
-      )}
 
-      {/* Scan button */}
-      {scanPages.length === 0 && (
-        <button onClick={() => { scanInputRef.current.setAttribute("capture","environment"); scanInputRef.current?.click(); }}
-          style={{ ...S.btn("primary","lg"), width:"100%", justifyContent:"center", marginBottom:10 }}>
-          <Camera size={18} /> Scan First Page
-        </button>
-      )}
+            {/* Page strip at bottom */}
+            {scanPages.length > 0 && (
+              <div style={{ position:"absolute", bottom:100, left:0, right:0,
+                             display:"flex", gap:6, padding:"6px 12px", overflowX:"auto" }}>
+                {scanPages.map((src, i) => (
+                  <div key={i} style={{ position:"relative", flexShrink:0 }}>
+                    <img src={src} style={{ width:50, height:70, objectFit:"cover",
+                                             borderRadius:6, border:"2px solid #0F6E56" }} />
+                    <div style={{ position:"absolute", top:1, left:3, background:"#0F6E56",
+                                   color:"#fff", fontSize:9, fontWeight:700,
+                                   padding:"0 4px", borderRadius:3 }}>{i+1}</div>
+                    <button onClick={() => removeScanPage(i)}
+                      style={{ position:"absolute", top:1, right:1, background:"rgba(0,0,0,0.7)",
+                                border:"none", borderRadius:"50%", width:16, height:16,
+                                cursor:"pointer", color:"#fff", fontSize:9,
+                                display:"flex", alignItems:"center", justifyContent:"center" }}>
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
 
-      {/* Action buttons */}
-      {scanPages.length > 0 && (
-        <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
-          <div style={{ fontSize:12, color:"var(--teal)", fontWeight:600, textAlign:"center" }}>
-            {scanPages.length} page{scanPages.length!==1?"s":""} scanned
+            {/* Capture button */}
+            <div style={{ position:"absolute", bottom:0, left:0, right:0, padding:"16px",
+                           background:"linear-gradient(transparent, rgba(0,0,0,0.7))",
+                           display:"flex", alignItems:"center", justifyContent:"center", gap:20 }}>
+              {scanPages.length > 0 && (
+                <button onClick={() => saveScanAsPDF(false)} disabled={scanBusy}
+                  style={{ background:"rgba(255,255,255,0.15)", border:"1px solid rgba(255,255,255,0.4)",
+                            borderRadius:20, padding:"8px 16px", cursor:"pointer", color:"#fff",
+                            fontSize:11, fontWeight:600, display:"flex", alignItems:"center", gap:6 }}>
+                  <Download size={13}/> Save PDF
+                </button>
+              )}
+
+              {/* Main shutter */}
+              <button onClick={captureFrame}
+                style={{ width:68, height:68, borderRadius:"50%",
+                          background: docDetected ? "#0F6E56" : "#fff",
+                          border:`3px solid ${docDetected ? "#D1FAE5" : "#ccc"}`,
+                          cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center",
+                          boxShadow: docDetected ? "0 0 20px rgba(15,110,86,0.6)" : "none",
+                          transition:"all 0.2s" }}>
+                <Camera size={26} color={docDetected ? "#fff" : "#111"} />
+              </button>
+
+              {scanPages.length > 0 && (
+                <button onClick={() => saveScanAsPDF(true)} disabled={scanBusy}
+                  style={{ background:"rgba(15,110,86,0.8)", border:"1px solid #0F6E56",
+                            borderRadius:20, padding:"8px 16px", cursor:"pointer", color:"#fff",
+                            fontSize:11, fontWeight:600, display:"flex", alignItems:"center", gap:6 }}>
+                  <ScanLine size={13}/> Save + OCR
+                </button>
+              )}
+            </div>
           </div>
-          <button onClick={() => saveScanAsPDF(false)} disabled={scanBusy}
-            style={{ ...S.btn("primary","md"), width:"100%", justifyContent:"center" }}>
-            {scanBusy ? <Spinner size={14}/> : <Download size={14}/>}
-            Save as PDF (no OCR)
-          </button>
-          <button onClick={() => saveScanAsPDF(true)} disabled={scanBusy}
-            style={{ ...S.btn("teal_l","md"), width:"100%", justifyContent:"center" }}>
-            {scanBusy ? <Spinner size={14}/> : <ScanLine size={14}/>}
-            Save PDF + Run OCR
-          </button>
-          <button onClick={() => setScanPages([])} style={{ ...S.btn("default","sm"), width:"100%", justifyContent:"center" }}>
-            <RotateCcw size={12}/> Start over
-          </button>
-        </div>
-      )}
+        )}
 
-      <input ref={scanInputRef} type="file" accept="image/*" capture="environment"
-        style={{ display:"none" }} onChange={e => { if(e.target.files[0]) addScanPage(e.target.files[0]); e.target.value=""; }} />
-
-      {/* Also allow gallery */}
-      <div style={{ marginTop:12 }}>
-        <button onClick={() => { scanInputRef.current.removeAttribute("capture"); scanInputRef.current?.click(); }}
-          style={{ ...S.btn("default","sm"), width:"100%", justifyContent:"center" }}>
-          <FilePlus size={13}/> Add from Gallery
-        </button>
+        {/* ── REVIEW PAGE ───────────────────────────────────────────────── */}
+        {camMode === "review" && lastCapture && (
+          <div style={{ flex:1, display:"flex", flexDirection:"column" }}>
+            <img src={lastCapture} style={{ flex:1, objectFit:"contain", display:"block" }} />
+            <div style={{ padding:"16px", background:"#111",
+                           display:"flex", alignItems:"center", justifyContent:"space-around" }}>
+              <button onClick={retakePage}
+                style={{ background:"#333", border:"none", borderRadius:12, padding:"12px 24px",
+                          cursor:"pointer", color:"#fff", fontWeight:600, fontSize:13,
+                          display:"flex", alignItems:"center", gap:8 }}>
+                <RotateCcw size={15}/> Retake
+              </button>
+              <div style={{ textAlign:"center" }}>
+                <div style={{ color:"#aaa", fontSize:11 }}>Page {scanPages.length+1}</div>
+                <div style={{ color:"#fff", fontSize:10, marginTop:2 }}>Auto-cropped ✓</div>
+              </div>
+              <button onClick={acceptPage}
+                style={{ background:"#0F6E56", border:"none", borderRadius:12, padding:"12px 24px",
+                          cursor:"pointer", color:"#fff", fontWeight:600, fontSize:13,
+                          display:"flex", alignItems:"center", gap:8 }}>
+                <CheckCircle size={15}/> Keep
+              </button>
+            </div>
+            <div style={{ display:"flex", gap:8, padding:"0 16px 16px", background:"#111" }}>
+              <button onClick={() => { acceptPage(); }} style={{
+                flex:1, background:"#1a1a1a", border:"1px solid #333", borderRadius:10,
+                padding:"10px", cursor:"pointer", color:"#aaa", fontSize:12,
+                display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}>
+                <Plus size={13}/> Accept &amp; scan next
+              </button>
+            </div>
+          </div>
+        )}
       </div>
-    </div>
-  );
+    );
+
+    // ── IDLE — start screen ────────────────────────────────────────────────
+    return (
+      <div style={{ padding:"0 0 16px" }}>
+        <p style={S.muted}>Live camera scanner with auto edge detection. Or use file upload as fallback.</p>
+        <div style={{ height:10 }} />
+
+        {/* Page thumbnails if any saved */}
+        {scanPages.length > 0 && (
+          <div>
+            <div style={{ fontSize:11, color:"var(--teal)", fontWeight:600, marginBottom:8 }}>
+              {scanPages.length} page{scanPages.length!==1?"s":""} ready
+            </div>
+            <div style={{ display:"flex", gap:8, overflowX:"auto", paddingBottom:8, marginBottom:12 }}>
+              {scanPages.map((src, idx) => (
+                <div key={idx} style={{ position:"relative", flexShrink:0 }}>
+                  <img src={src} style={{ width:70, height:96, objectFit:"cover",
+                                           borderRadius:"var(--radius-md)", border:"2px solid var(--teal)" }} />
+                  <div style={{ position:"absolute", top:2, left:3, background:"var(--teal)",
+                                 color:"#fff", fontSize:9, fontWeight:700, padding:"0 4px", borderRadius:3 }}>
+                    {idx+1}
+                  </div>
+                  <button onClick={() => removeScanPage(idx)} style={{
+                    position:"absolute", top:2, right:2, background:"rgba(0,0,0,0.6)",
+                    border:"none", borderRadius:"50%", width:18, height:18,
+                    cursor:"pointer", color:"#fff", fontSize:10,
+                    display:"flex", alignItems:"center", justifyContent:"center" }}>
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+            <div style={{ display:"flex", flexDirection:"column", gap:8, marginBottom:12 }}>
+              <button onClick={() => saveScanAsPDF(false)} disabled={scanBusy}
+                style={{ ...S.btn("default","md"), width:"100%", justifyContent:"center" }}>
+                {scanBusy ? <Spinner size={13}/> : <Download size={13}/>}
+                ⬇️ Download Native PDF (no OCR)
+              </button>
+              <button onClick={() => saveScanAsPDF(true)} disabled={scanBusy}
+                style={{ ...S.btn("primary","md"), width:"100%", justifyContent:"center" }}>
+                {scanBusy ? <Spinner size={13}/> : <ScanLine size={13}/>}
+                ☁️ Save PDF + Cloud OCR
+              </button>
+              <button onClick={() => setScanPages([])}
+                style={{ ...S.btn("ghost","sm"), width:"100%", justifyContent:"center" }}>
+                <RotateCcw size={11}/> Clear all pages
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Start camera */}
+        <button onClick={startCamera}
+          style={{ ...S.btn("primary","lg"), width:"100%", justifyContent:"center", marginBottom:10 }}>
+          <Camera size={18}/> {scanPages.length > 0 ? "Scan More Pages" : "Open Live Scanner"}
+        </button>
+
+        {/* Fallback file input */}
+        <button onClick={() => scanInputRef.current?.click()}
+          style={{ ...S.btn("default","sm"), width:"100%", justifyContent:"center" }}>
+          <FilePlus size={13}/> Add from Gallery / Files
+        </button>
+        <input ref={scanInputRef} type="file" accept="image/*" multiple style={{ display:"none" }}
+          onChange={e => { [...(e.target.files||[])].forEach(f => addPageFromFile(f)); e.target.value=""; }} />
+
+        <div style={{ marginTop:10, padding:"8px 10px", background:"var(--teal-xl)",
+                       borderRadius:"var(--radius-md)", border:"1px solid var(--teal-l)" }}>
+          <div style={{ fontSize:11, color:"var(--teal)", fontWeight:600 }}>💡 How it works</div>
+          <div style={{ fontSize:11, color:"var(--gray)", marginTop:3, lineHeight:1.5 }}>
+            Green brackets appear when a document is detected. Tap the shutter. Review → Keep or Retake.
+            Scan as many pages as needed. Native PDF downloads instantly — OCR runs in the cloud.
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   // ─────────────────────────────────────────────────────────────────────────
   // MOBILE layout
