@@ -809,7 +809,7 @@ export default function App() {
   };
 
   // ── Process one file ──────────────────────────────────────────────────────
-  const processFile = useCallback(async (file, existingDocId = null, pageNum = null) => {
+  const processFile = useCallback(async (file, existingDocId = null, silent = false) => {
     const id    = existingDocId || uid();
     const ext   = file.name.split(".").pop().toLowerCase();
     const isImg = file.type.startsWith("image/");
@@ -818,11 +818,10 @@ export default function App() {
     let thumb = null;
     let croppedFile = file;
     if (isImg) {
-      patchDoc(id, { progressLabel:"Auto-cropping…", progress:5 });
+      if (!silent) patchDoc(id, { progressLabel:"Auto-cropping…", progress:5 });
       const rawDataURL = await toDataURL(file);
       const croppedDataURL = await autoCropImage(rawDataURL);
       thumb = croppedDataURL;
-      // Convert cropped dataURL back to File
       const res = await fetch(croppedDataURL);
       const blob = await res.blob();
       croppedFile = new File([blob], file.name, { type:"image/jpeg" });
@@ -834,12 +833,15 @@ export default function App() {
         date: Date.now(), status:"processing",
         thumb, rawFile: croppedFile, ext, pages:1,
         text:"", sections:[], wordCount:0, charCount:0,
-        progress:5, progressLabel:"Auto-cropped — starting OCR…",
-        allPages: [], // for multi-page
+        progress:5, progressLabel:"Starting OCR…",
+        allPages: [],
       };
       setDocs(ds => [newDoc, ...ds]);
-      setActiveId(id);
-      if (isMobile) setMobileTab("result");
+      // Only navigate if not silent (silent = called from scan background OCR)
+      if (!silent) {
+        setActiveId(id);
+        if (isMobile) setMobileTab("result");
+      }
     }
 
     try {
@@ -1230,11 +1232,14 @@ export default function App() {
   const animFrameRef  = useRef(null);
   const scanInputRef  = useRef(null);
 
-  const [camMode,      setCamMode]      = useState("idle");   // idle | live | review | saving
-  const [lastCapture,  setLastCapture]  = useState(null);     // dataURL of last captured page
+  const [camMode,      setCamMode]      = useState("idle");   // idle | live | review | crop
+  const [lastCapture,  setLastCapture]  = useState(null);
+  const [rawCapture,   setRawCapture]   = useState(null);     // original before crop
   const [docDetected,  setDocDetected]  = useState(false);
   const [flashOn,      setFlashOn]      = useState(false);
   const [torchTrack,   setTorchTrack]   = useState(null);
+  const [cropBox,      setCropBox]      = useState({ x:10, y:10, w:80, h:80 }); // % values
+  const cropDragRef = useRef(null);
 
   // Detect mobile browser
   const isMobileBrowser = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
@@ -1363,6 +1368,7 @@ export default function App() {
     const raw = canvas.toDataURL("image/jpeg", 0.95);
     // Auto-crop then show review
     autoCropImage(raw).then(cropped => {
+      setRawCapture(raw);
       setLastCapture(cropped);
       setCamMode("review");
       cancelAnimationFrame(animFrameRef.current);
@@ -1407,24 +1413,22 @@ export default function App() {
     setScanBusy(true);
     try {
       const title = `Scan_${new Date().toLocaleDateString("en-GB").replace(/\//g,"-")}`;
-      // Always download the native scan PDF immediately
       const pdf = await scanPagesToPDF(scanPages);
       pdf.save(`${title}_native.pdf`);
       notify(`📄 Native PDF saved — ${scanPages.length} page(s)!`, "ok");
 
       if (runOCR) {
-        notify("☁️ OCR running in cloud — check Library shortly…", "ok");
-        // Fire OCR for all pages in background (don't await — non-blocking)
+        notify("☁️ OCR running in cloud — check Library tab shortly…", "ok");
         scanPages.forEach(async (pageDataURL, i) => {
           const res  = await fetch(pageDataURL);
           const blob = await res.blob();
           const file = new File([blob], `${title}_p${i+1}.jpg`, { type:"image/jpeg" });
-          processFile(file);  // non-blocking background OCR
+          processFile(file, null, true); // silent — don't navigate away
         });
-        if (isMobile) setMobileTab("library");
+        // Stay on scan tab — do NOT switch tabs or set activeId
       }
       setScanPages([]);
-      stopCamera();
+      setCamMode("idle");
     } catch (e) {
       notify(`Save failed: ${e.message}`, "error");
     } finally {
@@ -1437,13 +1441,14 @@ export default function App() {
     if (!file) return;
     const raw     = await toDataURL(file);
     const cropped = await autoCropImage(raw);
+    setRawCapture(raw);
     setLastCapture(cropped);
     setCamMode("review");
   };
 
   const ScanSession = () => {
     // ── LIVE VIEWFINDER ────────────────────────────────────────────────────
-    if (camMode === "live" || camMode === "review") return (
+    if (camMode === "live" || camMode === "review" || camMode === "crop") return (
       <div style={{ position:"fixed", inset:0, background:"#000", zIndex:200,
                     display:"flex", flexDirection:"column" }}>
         {/* Camera feed */}
@@ -1597,6 +1602,174 @@ export default function App() {
                 color:"#aaa", fontSize:12, fontWeight:500,
                 display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}>
                 <Download size={13}/> Keep &amp; Save
+              </button>
+            </div>
+
+            {/* Adjust crop button */}
+            {rawCapture && (
+              <div style={{ padding:"0 16px 12px", flexShrink:0 }}>
+                <button onClick={() => {
+                  setCropBox({ x:5, y:5, w:90, h:90 });
+                  setCamMode("crop");
+                }} style={{
+                  width:"100%", background:"#1a1a1a", border:"1px solid #444",
+                  borderRadius:10, padding:"9px 0", cursor:"pointer",
+                  color:"#ccc", fontSize:12, fontWeight:500,
+                  display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}>
+                  <Scissors size={13}/> Adjust Crop Manually
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── MANUAL CROP SCREEN ────────────────────────────────────────────── */}
+        {camMode === "crop" && rawCapture && (
+          <div style={{ flex:1, display:"flex", flexDirection:"column", background:"#111",
+                        height:"100%", overflow:"hidden" }}>
+            <div style={{ padding:"12px 16px 8px", display:"flex", alignItems:"center",
+                           justifyContent:"space-between", flexShrink:0 }}>
+              <button onClick={() => setCamMode("review")} style={{
+                background:"none", border:"none", color:"#aaa", cursor:"pointer",
+                display:"flex", alignItems:"center", gap:6, fontSize:13 }}>
+                <X size={15}/> Cancel
+              </button>
+              <span style={{ color:"#fff", fontSize:13, fontWeight:600 }}>Adjust Crop</span>
+              <button onClick={async () => {
+                // Apply the crop box to the raw image
+                const img = new Image();
+                img.onload = () => {
+                  const c = document.createElement("canvas");
+                  const fx = (cropBox.x / 100) * img.width;
+                  const fy = (cropBox.y / 100) * img.height;
+                  const fw = (cropBox.w / 100) * img.width;
+                  const fh = (cropBox.h / 100) * img.height;
+                  c.width  = fw;
+                  c.height = fh;
+                  c.getContext("2d").drawImage(img, fx, fy, fw, fh, 0, 0, fw, fh);
+                  setLastCapture(c.toDataURL("image/jpeg", 0.92));
+                  setCamMode("review");
+                };
+                img.src = rawCapture;
+              }} style={{
+                background:"#0F6E56", border:"none", borderRadius:8,
+                padding:"6px 14px", cursor:"pointer", color:"#fff",
+                fontSize:13, fontWeight:600 }}>
+                Apply ✓
+              </button>
+            </div>
+
+            <div style={{ fontSize:11, color:"#888", textAlign:"center", marginBottom:6, flexShrink:0 }}>
+              Drag the handles to adjust the crop area
+            </div>
+
+            {/* Crop canvas area */}
+            <div style={{ flex:1, minHeight:0, position:"relative", padding:"8px 16px", overflow:"hidden" }}
+              onMouseMove={(e) => {
+                if (!cropDragRef.current) return;
+                const rect = e.currentTarget.getBoundingClientRect();
+                const px = ((e.clientX - rect.left) / rect.width)  * 100;
+                const py = ((e.clientY - rect.top)  / rect.height) * 100;
+                const { handle } = cropDragRef.current;
+                setCropBox(prev => {
+                  const b = { ...prev };
+                  if (handle === "tl") { const dx=px-b.x; const dy=py-b.y; b.x=Math.min(px,b.x+b.w-10); b.y=Math.min(py,b.y+b.h-10); b.w=b.w+(prev.x-b.x); b.h=b.h+(prev.y-b.y); }
+                  if (handle === "tr") { b.w=Math.max(10, px-b.x); b.y=Math.min(py,b.y+b.h-10); b.h=b.h+(prev.y-b.y); }
+                  if (handle === "bl") { b.x=Math.min(px,b.x+b.w-10); b.w=b.w+(prev.x-b.x); b.h=Math.max(10, py-b.y); }
+                  if (handle === "br") { b.w=Math.max(10, px-b.x); b.h=Math.max(10, py-b.y); }
+                  if (handle === "move") { b.x=Math.max(0,Math.min(100-b.w, px-cropDragRef.current.ox)); b.y=Math.max(0,Math.min(100-b.h, py-cropDragRef.current.oy)); }
+                  return b;
+                });
+              }}
+              onMouseUp={() => { cropDragRef.current = null; }}
+              onTouchMove={(e) => {
+                if (!cropDragRef.current) return;
+                e.preventDefault();
+                const t = e.touches[0];
+                const rect = e.currentTarget.getBoundingClientRect();
+                const px = ((t.clientX - rect.left) / rect.width)  * 100;
+                const py = ((t.clientY - rect.top)  / rect.height) * 100;
+                const { handle } = cropDragRef.current;
+                setCropBox(prev => {
+                  const b = { ...prev };
+                  if (handle === "tl") { b.x=Math.min(px,b.x+b.w-10); b.y=Math.min(py,b.y+b.h-10); b.w=b.w+(prev.x-b.x); b.h=b.h+(prev.y-b.y); }
+                  if (handle === "tr") { b.w=Math.max(10, px-b.x); b.y=Math.min(py,b.y+b.h-10); b.h=b.h+(prev.y-b.y); }
+                  if (handle === "bl") { b.x=Math.min(px,b.x+b.w-10); b.w=b.w+(prev.x-b.x); b.h=Math.max(10, py-b.y); }
+                  if (handle === "br") { b.w=Math.max(10, px-b.x); b.h=Math.max(10, py-b.y); }
+                  if (handle === "move") { b.x=Math.max(0,Math.min(100-b.w, px-cropDragRef.current.ox)); b.y=Math.max(0,Math.min(100-b.h, py-cropDragRef.current.oy)); }
+                  return b;
+                });
+              }}
+              onTouchEnd={() => { cropDragRef.current = null; }}
+            >
+              <div style={{ position:"relative", width:"100%", height:"100%" }}>
+                <img src={rawCapture} style={{ width:"100%", height:"100%", objectFit:"contain",
+                                               display:"block", userSelect:"none" }} draggable={false} />
+
+                {/* Dark overlay outside crop box */}
+                <div style={{ position:"absolute", inset:0, pointerEvents:"none" }}>
+                  {/* Top */}
+                  <div style={{ position:"absolute", top:0, left:0, right:0,
+                                 height:`${cropBox.y}%`, background:"rgba(0,0,0,0.55)" }} />
+                  {/* Bottom */}
+                  <div style={{ position:"absolute", bottom:0, left:0, right:0,
+                                 height:`${100-cropBox.y-cropBox.h}%`, background:"rgba(0,0,0,0.55)" }} />
+                  {/* Left */}
+                  <div style={{ position:"absolute", left:0, top:`${cropBox.y}%`,
+                                 width:`${cropBox.x}%`, height:`${cropBox.h}%`, background:"rgba(0,0,0,0.55)" }} />
+                  {/* Right */}
+                  <div style={{ position:"absolute", right:0, top:`${cropBox.y}%`,
+                                 width:`${100-cropBox.x-cropBox.w}%`, height:`${cropBox.h}%`, background:"rgba(0,0,0,0.55)" }} />
+                </div>
+
+                {/* Crop box border */}
+                <div
+                  onMouseDown={(e) => { const rect=e.currentTarget.parentElement.getBoundingClientRect(); cropDragRef.current={handle:"move",ox:((e.clientX-rect.left)/rect.width)*100-cropBox.x,oy:((e.clientY-rect.top)/rect.height)*100-cropBox.y}; e.stopPropagation(); }}
+                  onTouchStart={(e) => { const t=e.touches[0]; const rect=e.currentTarget.parentElement.getBoundingClientRect(); cropDragRef.current={handle:"move",ox:((t.clientX-rect.left)/rect.width)*100-cropBox.x,oy:((t.clientY-rect.top)/rect.height)*100-cropBox.y}; e.stopPropagation(); }}
+                  style={{
+                    position:"absolute",
+                    left:`${cropBox.x}%`, top:`${cropBox.y}%`,
+                    width:`${cropBox.w}%`, height:`${cropBox.h}%`,
+                    border:"2px solid #0F6E56",
+                    boxSizing:"border-box", cursor:"move", touchAction:"none",
+                  }}>
+                  {/* Grid lines */}
+                  <div style={{ position:"absolute", inset:0, pointerEvents:"none",
+                                 backgroundImage:"linear-gradient(rgba(15,110,86,0.25) 1px,transparent 1px),linear-gradient(90deg,rgba(15,110,86,0.25) 1px,transparent 1px)",
+                                 backgroundSize:"33.33% 33.33%" }} />
+
+                  {/* Corner handles */}
+                  {[
+                    { h:"tl", style:{ top:-6, left:-6, cursor:"nw-resize" } },
+                    { h:"tr", style:{ top:-6, right:-6, cursor:"ne-resize" } },
+                    { h:"bl", style:{ bottom:-6, left:-6, cursor:"sw-resize" } },
+                    { h:"br", style:{ bottom:-6, right:-6, cursor:"se-resize" } },
+                  ].map(({ h, style }) => (
+                    <div key={h}
+                      onMouseDown={(e) => { cropDragRef.current={handle:h}; e.stopPropagation(); }}
+                      onTouchStart={(e) => { cropDragRef.current={handle:h}; e.stopPropagation(); }}
+                      style={{
+                        position:"absolute", width:20, height:20,
+                        background:"#0F6E56", borderRadius:3, touchAction:"none", ...style
+                      }} />
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div style={{ padding:"10px 16px 20px", flexShrink:0 }}>
+              <button onClick={() => {
+                // Reset to auto-crop
+                autoCropImage(rawCapture).then(c => {
+                  setLastCapture(c);
+                  setCamMode("review");
+                });
+              }} style={{
+                width:"100%", background:"#1a1a1a", border:"1px solid #333",
+                borderRadius:10, padding:"10px 0", cursor:"pointer",
+                color:"#aaa", fontSize:12,
+                display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}>
+                <RotateCcw size={12}/> Reset to Auto-Crop
               </button>
             </div>
           </div>
