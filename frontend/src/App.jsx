@@ -122,10 +122,57 @@ const toDataURL = (file) => new Promise((res, rej) => {
   r.readAsDataURL(file);
 });
 
+// ─── Native file save — uses showSaveFilePicker on supported browsers ─────────
+async function nativeSave(blob, suggestedName, mimeType) {
+  // Try native File System Access API (Chrome/Edge desktop + Android Chrome)
+  if (window.showSaveFilePicker) {
+    try {
+      const ext   = suggestedName.split(".").pop();
+      const types = [{ description: ext.toUpperCase() + " file",
+                       accept: { [mimeType]: ["." + ext] } }];
+      const handle   = await window.showSaveFilePicker({ suggestedName, types });
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return;
+    } catch (e) {
+      if (e.name === "AbortError") return; // user cancelled
+      // Fall through
+    }
+  }
+
+  const url = URL.createObjectURL(blob);
+
+  // iOS Safari — open in new tab so Share Sheet appears
+  const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+  if (isIOS) {
+    const tab = window.open(url, "_blank");
+    // Show instruction toast
+    setTimeout(() => {
+      if (!tab) {
+        // Popup blocked — fallback to anchor
+        const a = document.createElement("a");
+        a.href = url; a.download = suggestedName;
+        a.click();
+      }
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+    }, 500);
+    return;
+  }
+
+  // All other browsers — anchor download
+  const a = document.createElement("a");
+  a.href = url; a.download = suggestedName;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
 // Download blob received from backend fetch — 90s timeout for heavy exports
-async function downloadBlob(url, formData, filename) {
+async function downloadBlob(url, formData, filename, mimeType = "application/octet-stream") {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 90000); // 90s
+  const timer = setTimeout(() => controller.abort(), 90000);
   try {
     const res = await fetch(url, { method:"POST", body:formData, signal:controller.signal });
     clearTimeout(timer);
@@ -134,11 +181,7 @@ async function downloadBlob(url, formData, filename) {
       throw new Error(`Server error ${res.status}: ${errText.slice(0,120)}`);
     }
     const blob = await res.blob();
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = filename;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    await nativeSave(blob, filename, mimeType);
   } catch(e) {
     clearTimeout(timer);
     if (e.name === "AbortError") throw new Error("Request timed out — server may be waking up, try again in 30s");
@@ -419,13 +462,16 @@ function ExportPanel({ doc, apiStatus, notify, compact = false }) {
       if (format === "txt") {
         const header = `${"=".repeat(70)}\n  ${doc.title}\n  Generated: ${new Date().toLocaleString()}\n${"=".repeat(70)}\n\n`;
         const blob = new Blob([header + doc.text], { type:"text/plain" });
-        const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
-        a.download = `${safeName(doc.title)}.txt`; a.click();
-        setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+        await nativeSave(blob, `${safeName(doc.title)}.txt`, "text/plain");
         notify("TXT downloaded!", "ok");
       } else if (apiStatus === "ok") {
-        await downloadBlob(`${API}/api/export/${format}`, fd, `${safeName(doc.title)}.${format}`);
-        notify(`${format.toUpperCase()} downloaded!`, "ok");
+        const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+        const mimes = { pdf:"application/pdf", docx:"application/vnd.openxmlformats-officedocument.wordprocessingml.document" };
+        await downloadBlob(`${API}/api/export/${format}`, fd,
+                           `${safeName(doc.title)}.${format}`, mimes[format] || "application/octet-stream");
+        notify(isIOS
+          ? `${format.toUpperCase()} ready — tap Share → Save to Files`
+          : `${format.toUpperCase()} downloaded!`, "ok");
       } else if (format === "pdf") {
         await clientPDF(doc); notify("PDF downloaded (browser mode)!", "ok");
       } else {
@@ -448,7 +494,7 @@ function ExportPanel({ doc, apiStatus, notify, compact = false }) {
       fd.append("title",  doc.title || "Document");
       fd.append("author", "DocScanPro");
       await downloadBlob(`${API}/api/export/pdf`, fd,
-                         `${safeName(doc.title)}_searchable.pdf`);
+                         `${safeName(doc.title)}_searchable.pdf`, "application/pdf");
       notify("Searchable PDF downloaded!", "ok");
     } catch (e) {
       notify(`Searchable PDF failed: ${e.message}`, "error");
@@ -796,7 +842,7 @@ export default function App() {
       try {
         // Show "waking" if currently offline (Railway cold start)
         setApiStatus(s => s === "offline" ? "waking" : s);
-        const r = await fetch(`${API}/api/health`, { signal: AbortSignal.timeout(12000) });
+        const r = await fetch(`${API}/api/health`, { signal: AbortSignal.timeout(15000) });
         if (r.ok) {
           setApiStatus("ok");
         } else {
@@ -1469,8 +1515,11 @@ export default function App() {
     setScanBusy(true);
     try {
       const title = `Scan_${new Date().toLocaleDateString("en-GB").replace(/\//g,"-")}`;
-      const pdf = await scanPagesToPDF(scanPages);
-      pdf.save(`${title}_native.pdf`);
+      const pdf   = await scanPagesToPDF(scanPages);
+
+      // Save with native file picker
+      const pdfBlob = pdf.output("blob");
+      await nativeSave(pdfBlob, `${title}_native.pdf`, "application/pdf");
       notify(`📄 Native PDF saved — ${scanPages.length} page(s)!`, "ok");
 
       if (runOCR) {
@@ -1479,14 +1528,16 @@ export default function App() {
           const res  = await fetch(pageDataURL);
           const blob = await res.blob();
           const file = new File([blob], `${title}_p${i+1}.jpg`, { type:"image/jpeg" });
-          processFile(file, null, true); // silent — don't navigate away
+          processFile(file, null, true);
         });
-        // Stay on scan tab — do NOT switch tabs or set activeId
       }
+      // Fully reset all scan state — clears fullscreen overlay
       setScanPages([]);
+      setLastCapture(null);
+      setRawCapture(null);
       setCamMode("idle");
     } catch (e) {
-      notify(`Save failed: ${e.message}`, "error");
+      if (e.message !== "AbortError") notify(`Save failed: ${e.message}`, "error");
     } finally {
       setScanBusy(false);
     }
