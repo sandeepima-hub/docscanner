@@ -71,6 +71,65 @@ TEMP_DIR = Path(tempfile.gettempdir()) / "docscanner"
 TEMP_DIR.mkdir(exist_ok=True)
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif", ".gif"}
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "")
+GOOGLE_VISION_CREDENTIALS = os.environ.get("GOOGLE_VISION_CREDENTIALS", "")
+
+# ── Google Vision setup ───────────────────────────────────────────────────────
+VISION_CLIENT = None
+VISION_AVAILABLE = False
+
+if GOOGLE_VISION_CREDENTIALS:
+    try:
+        import json as _json
+        from google.cloud import vision
+        from google.oauth2 import service_account
+        _creds_dict = _json.loads(GOOGLE_VISION_CREDENTIALS)
+        _creds = service_account.Credentials.from_service_account_info(
+            _creds_dict,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        VISION_CLIENT = vision.ImageAnnotatorClient(credentials=_creds)
+        VISION_AVAILABLE = True
+    except Exception as e:
+        print(f"Google Vision setup failed: {e}")
+
+# ── Google Vision usage tracking (in-memory, resets on server restart) ────────
+# For persistent tracking, this should be in Supabase — works fine for now
+import datetime as _dt
+_vision_usage = {"month": _dt.date.today().strftime("%Y-%m"), "count": 0}
+VISION_MONTHLY_LIMIT = 1000  # free tier limit
+
+def vision_quota_ok() -> bool:
+    """Check if we're within Google Vision free quota."""
+    today_month = _dt.date.today().strftime("%Y-%m")
+    if _vision_usage["month"] != today_month:
+        _vision_usage["month"] = today_month
+        _vision_usage["count"] = 0
+    return _vision_usage["count"] < VISION_MONTHLY_LIMIT
+
+def vision_increment():
+    _vision_usage["count"] += 1
+
+
+# ── Google Vision OCR ─────────────────────────────────────────────────────────
+def google_vision_ocr(image_bytes: bytes) -> str:
+    """Fast, accurate OCR using Google Cloud Vision."""
+    if not VISION_AVAILABLE or not VISION_CLIENT:
+        raise ValueError("Google Vision not available")
+    if not vision_quota_ok():
+        raise ValueError(f"Google Vision quota reached ({VISION_MONTHLY_LIMIT}/month) — using fallback")
+
+    from google.cloud import vision
+    image   = vision.Image(content=image_bytes)
+    response= VISION_CLIENT.document_text_detection(image=image)
+
+    if response.error.message:
+        raise ValueError(f"Vision API error: {response.error.message}")
+
+    vision_increment()
+
+    # Extract full text with layout preservation
+    full_text = response.full_text_annotation.text if response.full_text_annotation else ""
+    return full_text.strip()
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def tmp(suffix="") -> Path:
@@ -434,13 +493,30 @@ def health():
     return {
         "status": "ok",
         "capabilities": {
-            "ocr_pytesseract": OCR_AVAILABLE,
-            "ocr_mistral":     bool(MISTRAL_API_KEY),
-            "pdf2image":       PDF2IMAGE_AVAILABLE,
-            "ocrmypdf":        OCRMYPDF_AVAILABLE,
-            "docx_export":     DOCX_AVAILABLE,
-            "pdf_export":      REPORTLAB_AVAILABLE,
+            "ocr_pytesseract":   OCR_AVAILABLE,
+            "ocr_mistral":       bool(MISTRAL_API_KEY),
+            "ocr_google_vision": VISION_AVAILABLE,
+            "vision_quota_ok":   vision_quota_ok(),
+            "vision_used":       _vision_usage["count"],
+            "vision_limit":      VISION_MONTHLY_LIMIT,
+            "pdf2image":         PDF2IMAGE_AVAILABLE,
+            "ocrmypdf":          OCRMYPDF_AVAILABLE,
+            "docx_export":       DOCX_AVAILABLE,
+            "pdf_export":        REPORTLAB_AVAILABLE,
         },
+    }
+
+
+@app.get("/api/vision/usage")
+def vision_usage():
+    """Check Google Vision quota usage."""
+    return {
+        "month":    _vision_usage["month"],
+        "used":     _vision_usage["count"],
+        "limit":    VISION_MONTHLY_LIMIT,
+        "remaining":VISION_MONTHLY_LIMIT - _vision_usage["count"],
+        "enabled":  VISION_AVAILABLE and vision_quota_ok(),
+        "pct":      round(_vision_usage["count"] / VISION_MONTHLY_LIMIT * 100, 1),
     }
 
 
@@ -452,44 +528,52 @@ async def ocr(
 ):
     data = await file.read()
     ext  = Path(file.filename or "").suffix.lower()
-    use_mistral = engine == "mistral" or (engine == "auto" and bool(MISTRAL_API_KEY))
 
     images_bytes: list[bytes] = []
     if ext == ".pdf":
         if not PDF2IMAGE_AVAILABLE:
             raise HTTPException(400, "pdf2image not available")
-        # Lower DPI to reduce memory usage on free tier
         for img in convert_from_bytes(data, dpi=150, fmt="jpeg"):
             buf = io.BytesIO()
             img.save(buf, "JPEG", quality=85)
             images_bytes.append(buf.getvalue())
-            del img  # free memory immediately
+            del img
     elif ext in IMAGE_EXTS or (file.content_type or "").startswith("image/"):
         images_bytes = [data]
     else:
         raise HTTPException(400, f"Unsupported: {ext}")
 
-    page_texts = []
+    page_texts  = []
+    engine_used = "tesseract"
+
     for i, img_bytes in enumerate(images_bytes):
-        if use_mistral:
+        text = ""
+
+        # ── Engine selection priority: Vision → Mistral → Tesseract ──────────
+        if engine in ("auto", "vision") and VISION_AVAILABLE and vision_quota_ok():
             try:
-                text = await mistral_ocr(img_bytes)
-            except Exception:
-                if OCR_AVAILABLE:
-                    img = Image.open(io.BytesIO(img_bytes))
-                    if img.mode not in ("RGB","L"): img = img.convert("RGB")
-                    text = pytesseract.image_to_string(img, lang=language)
-                    del img
-                else:
-                    text = "[OCR unavailable]"
-        else:
+                text        = google_vision_ocr(img_bytes)
+                engine_used = "google_vision"
+            except Exception as e:
+                print(f"Google Vision failed (page {i+1}): {e} — falling back")
+
+        if not text and (engine in ("auto", "mistral") and bool(MISTRAL_API_KEY)):
+            try:
+                text        = await mistral_ocr(img_bytes)
+                engine_used = "mistral"
+            except Exception as e:
+                print(f"Mistral failed (page {i+1}): {e} — falling back")
+
+        if not text:
             if not OCR_AVAILABLE:
-                raise HTTPException(500, "pytesseract not installed")
+                raise HTTPException(500, "No OCR engine available")
             img = Image.open(io.BytesIO(img_bytes))
             if img.mode not in ("RGB","L","RGBA"): img = img.convert("RGB")
-            text = pytesseract.image_to_string(img, lang=language)
-            del img  # free memory
-        import gc; gc.collect()  # force garbage collection
+            text        = pytesseract.image_to_string(img, lang=language)
+            engine_used = "tesseract"
+            del img
+
+        import gc; gc.collect()
         page_texts.append({"page": i+1, "text": text.strip()})
 
     full_text = "\n\n--- Page Break ---\n\n".join(p["text"] for p in page_texts)
@@ -500,7 +584,8 @@ async def ocr(
         "page_texts": page_texts, "sections": sections,
         "word_count": len(full_text.split()),
         "char_count": len(full_text),
-        "engine_used": "mistral" if use_mistral else "tesseract",
+        "engine_used": engine_used,
+        "vision_remaining": VISION_MONTHLY_LIMIT - _vision_usage["count"],
     })
 
 
