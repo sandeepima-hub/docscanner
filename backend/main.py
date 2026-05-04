@@ -645,12 +645,15 @@ async def export_searchable_pdf(
 
     fname = safe_name(Path(file.filename or "scan").stem) + "_searchable.pdf"
     background_tasks.add_task(rm, str(in_path))
-    background_tasks.add_task(rm, str(out_path))
+    # NOTE: Do NOT delete out_path in background task — FileResponse streams it
+    # and background tasks run while streaming is still happening on some deployments.
+    # The temp file will be cleaned by the OS eventually.
 
     return FileResponse(
         str(out_path),
         media_type = "application/pdf",
         filename   = fname,
+        background = BackgroundTasks(),  # empty — file stays until OS cleans it
     )
 
 
