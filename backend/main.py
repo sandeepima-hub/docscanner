@@ -665,8 +665,13 @@ async def export_searchable_pdf(
             else:
                 raise Exception("All pages failed OCR")
 
-    except Exception as e:
-        # Final fallback: image-only PDF
+ except Exception as e:
+        print(f"OCRmyPDF failed: {e}")
+        # If it's already a single PDF, just return it instead of crashing Pillow
+        if len(page_paths) == 1 and page_paths[0].suffix.lower() == ".pdf":
+            return FileResponse(str(page_paths[0]), media_type="application/pdf", filename="fallback.pdf")
+            
+        # Final fallback: image-only PDF for JPG/PNG inputs
         if not REPORTLAB_AVAILABLE:
             raise HTTPException(500, f"PDF generation failed: {e}")
         from reportlab.lib.pagesizes import A4
@@ -675,6 +680,8 @@ async def export_searchable_pdf(
         import io as _io
         story = []
         for i, pp in enumerate(page_paths):
+            if pp.suffix.lower() == ".pdf": 
+                continue # Skip PDFs to prevent Pillow UnidentifiedImageError
             raw = pp.read_bytes()
             img = PILImg.open(_io.BytesIO(raw))
             W, H = A4
