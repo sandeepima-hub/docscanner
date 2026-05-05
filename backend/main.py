@@ -593,19 +593,16 @@ async def ocr(
 @app.post("/api/export/searchable-pdf")
 async def export_searchable_pdf(
     background_tasks: BackgroundTasks,
-    files:    List[UploadFile] = File(...),  # accepts multiple pages
-    language: str              = Form("eng"),
+    language: str = Form("eng"),
+    files: List[UploadFile] = File(...),
 ):
     """
-    Takes one or more images, runs OCR on each, combines into a single
-    searchable PDF with image background + invisible text layer per page.
+    Takes one or more images, returns a searchable PDF with text layer.
+    Uses ocrmypdf (which uses pikepdf internally — no extra deps needed).
     """
     if not OCRMYPDF_AVAILABLE:
         raise HTTPException(500, "ocrmypdf not installed")
 
-    import tempfile, shutil
-
-    # Write each uploaded image to a temp file
     page_paths = []
     for f in files:
         data = await f.read()
@@ -618,20 +615,15 @@ async def export_searchable_pdf(
 
     try:
         if len(page_paths) == 1:
-            # Single page — ocrmypdf handles directly
+            # Single page
             ocrmypdf.ocr(
-                str(page_paths[0]),
-                str(out_path),
-                language     = language,
-                deskew       = True,
-                clean        = True,
-                optimize     = 1,
-                force_ocr    = True,
-                progress_bar = False,
-                output_type  = "pdf",
+                str(page_paths[0]), str(out_path),
+                language=language, deskew=True, clean=True,
+                optimize=1, force_ocr=True, progress_bar=False,
             )
         else:
-            # Multi-page: OCR each image into its own PDF, then merge
+            # Multi-page: OCR each page separately then merge with pikepdf
+            import pikepdf
             page_pdfs = []
             for pp in page_paths:
                 page_out = tmp(".pdf")
@@ -640,73 +632,63 @@ async def export_searchable_pdf(
                         str(pp), str(page_out),
                         language=language, deskew=True, clean=True,
                         optimize=1, force_ocr=True, progress_bar=False,
-                        output_type="pdf",
                     )
                     page_pdfs.append(page_out)
                 except Exception as e:
-                    print(f"OCR page failed: {e}, using image-only fallback")
-                    # Fallback: image-only page PDF
-                    from reportlab.lib.pagesizes import A4
-                    from reportlab.platypus import SimpleDocTemplate, Image as RLImg
-                    from PIL import Image as PILImg
-                    import io as _io
-                    buf = _io.BytesIO(pp.read_bytes())
-                    img = PILImg.open(buf)
-                    W,H = A4
-                    r = min(W/img.width, H/img.height)
-                    doc_rl = SimpleDocTemplate(str(page_out), pagesize=A4,
-                                               leftMargin=0,rightMargin=0,
-                                               topMargin=0,bottomMargin=0)
-                    doc_rl.build([RLImg(_io.BytesIO(pp.read_bytes()),
-                                        width=img.width*r, height=img.height*r)])
-                    page_pdfs.append(page_out)
+                    print(f"OCR page failed: {e}")
+                    # Fallback: image-only page
+                    if REPORTLAB_AVAILABLE:
+                        from reportlab.lib.pagesizes import A4
+                        from reportlab.platypus import SimpleDocTemplate, Image as RLImg
+                        from PIL import Image as PILImg
+                        import io as _io
+                        raw = pp.read_bytes()
+                        img = PILImg.open(_io.BytesIO(raw))
+                        W, H = A4
+                        r = min(W/img.width, H/img.height)
+                        doc_rl = SimpleDocTemplate(str(page_out), pagesize=A4,
+                                                   leftMargin=0,rightMargin=0,
+                                                   topMargin=0,bottomMargin=0)
+                        doc_rl.build([RLImg(_io.BytesIO(raw), width=img.width*r, height=img.height*r)])
+                        page_pdfs.append(page_out)
 
-            # Merge all page PDFs
-            from pypdf import PdfWriter, PdfReader
-            writer = PdfWriter()
-            for pp in page_pdfs:
-                try:
-                    reader = PdfReader(str(pp))
-                    for page in reader.pages:
-                        writer.add_page(page)
-                except Exception as e:
-                    print(f"Merge page failed: {e}")
-            with open(str(out_path), "wb") as f:
-                writer.write(f)
+            # Merge using pikepdf (already installed as ocrmypdf dependency)
+            if page_pdfs:
+                merger = pikepdf.Pdf.new()
+                for pp in page_pdfs:
+                    try:
+                        src = pikepdf.Pdf.open(str(pp))
+                        merger.pages.extend(src.pages)
+                    except Exception as e:
+                        print(f"Merge page failed: {e}")
+                merger.save(str(out_path))
+            else:
+                raise Exception("All pages failed OCR")
 
     except Exception as e:
-        # Fallback: image-only PDF via reportlab
+        # Final fallback: image-only PDF
         if not REPORTLAB_AVAILABLE:
-            raise HTTPException(500, f"OCR PDF failed: {e}")
+            raise HTTPException(500, f"PDF generation failed: {e}")
         from reportlab.lib.pagesizes import A4
         from reportlab.platypus import SimpleDocTemplate, Image as RLImg, PageBreak
         from PIL import Image as PILImg
         import io as _io
         story = []
         for i, pp in enumerate(page_paths):
-            data = pp.read_bytes()
-            buf = _io.BytesIO(data)
-            img = PILImg.open(buf)
+            raw = pp.read_bytes()
+            img = PILImg.open(_io.BytesIO(raw))
             W, H = A4
             r = min(W/img.width, H/img.height)
-            if i > 0:
-                story.append(PageBreak())
-            story.append(RLImg(_io.BytesIO(data), width=img.width*r, height=img.height*r))
+            if i > 0: story.append(PageBreak())
+            story.append(RLImg(_io.BytesIO(raw), width=img.width*r, height=img.height*r))
         doc_rl = SimpleDocTemplate(str(out_path), pagesize=A4,
-                                   leftMargin=0, rightMargin=0,
-                                   topMargin=0, bottomMargin=0)
+                                   leftMargin=0,rightMargin=0,topMargin=0,bottomMargin=0)
         doc_rl.build(story)
 
-    # Clean up input files
     for pp in page_paths:
         background_tasks.add_task(rm, str(pp))
 
-    fname = "searchable.pdf"
-    return FileResponse(
-        str(out_path),
-        media_type = "application/pdf",
-        filename   = fname,
-    )
+    return FileResponse(str(out_path), media_type="application/pdf", filename="searchable.pdf")
 
 
 @app.post("/api/export/pdf")
